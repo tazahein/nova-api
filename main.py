@@ -1,9 +1,10 @@
+import os
 from fastapi import FastAPI, HTTPException
 import psycopg
 
 app = FastAPI()
 
-DB = "dbname=nova_crm"
+DB = os.environ.get("DATABASE_URL", "dbname=nova_crm")
 
 @app.get("/")
 def home():
