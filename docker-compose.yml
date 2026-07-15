@@ -1,0 +1,23 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_PASSWORD: novapass
+      POSTGRES_DB: nova_crm
+    volumes:
+      - nova_data:/var/lib/postgresql
+      - ../nova-crm-postgresql/01-crm-database.sql:/docker-entrypoint-initdb.d/01.sql:ro
+      - ../nova-crm-postgresql/02-lead-manager.sql:/docker-entrypoint-initdb.d/02.sql:ro
+      - ../nova-crm-postgresql/03-customer-portal.sql:/docker-entrypoint-initdb.d/03.sql:ro
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "host=db dbname=nova_crm user=postgres password=novapass"
+    depends_on:
+      - db
+
+volumes:
+  nova_data:
