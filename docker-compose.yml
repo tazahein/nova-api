@@ -10,6 +10,12 @@ services:
       - ../nova-crm-postgresql/02-lead-manager.sql:/docker-entrypoint-initdb.d/02.sql:ro
       - ../nova-crm-postgresql/03-customer-portal.sql:/docker-entrypoint-initdb.d/03.sql:ro
 
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nova_crm"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   api:
     build: .
     ports:
@@ -17,7 +23,8 @@ services:
     environment:
       DATABASE_URL: "host=db dbname=nova_crm user=postgres password=novapass"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
 
 volumes:
   nova_data:
