@@ -2,7 +2,7 @@ services:
   db:
     image: postgres:18
     environment:
-      POSTGRES_PASSWORD: novapass
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: nova_crm
     volumes:
       - nova_data:/var/lib/postgresql
@@ -21,7 +21,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: "host=db dbname=nova_crm user=postgres password=novapass"
+      DATABASE_URL: "host=db dbname=nova_crm user=postgres password=${POSTGRES_PASSWORD}"
     depends_on:
       db:
         condition: service_healthy
