@@ -19,7 +19,7 @@ services:
   api:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       DATABASE_URL: "host=db dbname=nova_crm user=postgres password=${POSTGRES_PASSWORD}"
     depends_on:
