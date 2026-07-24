@@ -4,6 +4,8 @@ FastAPI connection layer over the [nova_crm PostgreSQL database](https://github.
 
 The database repo builds the schema (contacts → leads → customers → orders); this repo exposes it as a JSON API.
 
+**Live demo:** https://novatayza.duckdns.org ([interactive docs](https://novatayza.duckdns.org/docs))
+
 ## Endpoints
 
 | Method | Path | Returns |
@@ -75,4 +77,11 @@ Stop and remove:
 
 - Typed `datetime` fields in response models
 - ~~Dockerize~~ ✅ done — see Run with Docker
-- Cloud deployment
+- ~~Cloud deployment~~ ✅ done — see Deployment
+
+## Deployment
+
+Runs on a cloud VPS as a Docker Compose stack (see `docker-compose.yml`)
+behind an Nginx reverse proxy with Let's Encrypt HTTPS. The API container
+binds to loopback only; Nginx is the sole public entry point. The proxy
+config and a restore guide live in [`deploy/nginx/`](deploy/nginx/).
