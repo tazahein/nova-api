@@ -11,7 +11,7 @@ services:
       - ../nova-crm-postgresql/02-lead-manager.sql:/docker-entrypoint-initdb.d/02.sql:ro
       - ../nova-crm-postgresql/03-customer-portal.sql:/docker-entrypoint-initdb.d/03.sql:ro
       - ../nova-crm-postgresql/04-inquiries.sql:/docker-entrypoint-initdb.d/04.sql:ro
-
+      - ../nova-crm-postgresql/05-bookings.sql:/docker-entrypoint-initdb.d/05.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d nova_crm"]
       interval: 5s
