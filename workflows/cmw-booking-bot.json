@@ -1,0 +1,506 @@
+{
+  "name": "cmw-booking-bot",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -160,
+        -176
+      ],
+      "id": "99616762-8df2-4a7f-b551-1095fe6871fb",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\n  \"intent\": \"new_booking\",\n  \"requested_start\": \"2026-08-05T14:00\",\n  \"requested_date\": null,\n  \"treatment\": \"treatment_c\",\n  \"client_name\": \"Nan Test\",\n  \"client_email\": \"nan@example.com\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -16,
+        -128
+      ],
+      "id": "43eaa8d0-2935-4a9f-8f7e-25ce8d3d84f9",
+      "name": "Classify Intent"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Stub for the Google Calendar node. Change CASE, execute, read the result.\nconst CASE = 'A';\n\nconst ev = (start, end, summary) => ({\n  json: {\n    status: 'confirmed',\n    summary,\n    start: { dateTime: `2026-08-05T${start}:00+07:00` },\n    end:   { dateTime: `2026-08-05T${end}:00+07:00` },\n  },\n});\n\nconst CASES = {\n  // A: empty calendar. One field-less item, not zero items - see note below.\n  A: [{ json: {} }],\n\n  // B: four treatments running straight through 14:00-15:30. Capacity full.\n  B: [\n    ev('14:00', '15:30', 'B1'),\n    ev('14:00', '15:30', 'B2'),\n    ev('14:00', '15:30', 'B3'),\n    ev('14:00', '15:30', 'B4'),\n  ],\n\n  // C: FIVE events all touching the candidate window, but never more than\n  // THREE at once. Counting events says busy; counting concurrency says free.\n  C: [\n    ev('13:00', '14:00', 'C1'),\n    ev('13:15', '14:00', 'C2'),\n    ev('14:45', '15:30', 'C3'),\n    ev('15:00', '15:30', 'C4'),\n    ev('14:30', '15:00', 'C5'),\n  ],\n\n  // D: all-day entry. Meaning is ambiguous, must escalate.\n  D: [{ json: { status: 'confirmed', summary: 'D1', start: { date: '2026-08-05' }, end: { date: '2026-08-06' } } }],\n};\n\nreturn CASES[CASE];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        128,
+        -144
+      ],
+      "id": "9371cef2-a701-45e3-a4d8-116de0566712",
+      "name": "Calendar Events"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Availability check. Runs after the calendar events node.\n// Emits ONE item; a Switch downstream routes on json.decision.\n// WHY the calendar and not the bookings table: the front desk adds walk-ins\n// and phone bookings straight to the calendar. A DB-only check cannot see\n// those and will double-book.\n\n// ── CONFIG ────────────────────────────────────────────────────────────\nconst TZ = 'Asia/Bangkok';\nconst CAPACITY = 4;         // therapists. The binding constraint; rooms are not.\nconst TURNOVER_MIN = 15;\nconst OPEN_HOUR = 10;\nconst CLOSE_HOUR = 20;\nconst SLOT_GRID_MIN = 30;\nconst MIN_LEAD_MIN = 60;    // PLACEHOLDER - no same-minute bookings\nconst MAX_OFFERS = 4;       // keep the reply email readable\n\n// PLACEHOLDER durations in minutes. Keys must stay identical to the\n// treatment enum in the classifier schema.\nconst DURATIONS = {\n  treatment_a: 60,\n  treatment_b: 60,\n  treatment_c: 90,\n  treatment_d: 90,\n  treatment_e: 120,\n  treatment_f: 120,\n};\n\n// ── HELPERS ───────────────────────────────────────────────────────────\n\n// Max simultaneously-busy therapists over [from, to). Sweep line.\n// NOT a count of overlapping events: five events can touch a 90-minute\n// window while never more than two run at once. Counting events instead of\n// concurrency rejects bookable slots.\nfunction maxConcurrent(busy, from, to) {\n  const points = [];\n  for (const b of busy) {\n    const s = b.start < from ? from : b.start;\n    const e = b.end > to ? to : b.end;\n    if (e <= s) continue;\n    points.push([s.toMillis(), 1]);\n    points.push([e.toMillis(), -1]);\n  }\n  // At an identical instant, close before open, so back-to-back events\n  // do not read as overlapping.\n  points.sort((a, b) => a[0] - b[0] || a[1] - b[1]);\n\n  let current = 0;\n  let peak = 0;\n  for (const [, delta] of points) {\n    current += delta;\n    if (current > peak) peak = current;\n  }\n  return peak;\n}\n\nfunction parseEvents(items) {\n  const busy = [];\n  let hasAllDay = false;\n\n  for (const item of items) {\n    const e = item.json || {};\n    if (e.status === 'cancelled') continue;\n    if (e.transparency === 'transparent') continue;\n\n    // All-day entries carry start.date, not start.dateTime. A therapist's\n    // day off is capacity 3, a public holiday is capacity 0. Do not guess.\n    if (e.start && e.start.date && !e.start.dateTime) {\n      hasAllDay = true;\n      continue;\n    }\n    if (!e.start || !e.start.dateTime || !e.end || !e.end.dateTime) continue;\n\n    busy.push({\n      start: DateTime.fromISO(e.start.dateTime, { zone: TZ }),\n      // Turnover belongs to the therapist, so it extends the busy interval.\n      end: DateTime.fromISO(e.end.dateTime, { zone: TZ })\n        .plus({ minutes: TURNOVER_MIN }),\n    });\n  }\n  return { busy, hasAllDay };\n}\n\n// Bookable if the treatment finishes by closing time AND a therapist is\n// free for every instant it occupies.\nfunction isBookable(start, durationMin, busy) {\n  const treatmentEnd = start.plus({ minutes: durationMin });\n  const close = start.set({ hour: CLOSE_HOUR, minute: 0, second: 0, millisecond: 0 });\n  if (treatmentEnd > close) return false;\n\n  const blockEnd = treatmentEnd.plus({ minutes: TURNOVER_MIN });\n  return maxConcurrent(busy, start, blockEnd) < CAPACITY;\n}\n\nfunction openSlots(day, durationMin, busy, now) {\n  const out = [];\n  const earliest = now.plus({ minutes: MIN_LEAD_MIN });\n  let cursor = day.set({ hour: OPEN_HOUR, minute: 0, second: 0, millisecond: 0 });\n  const close = day.set({ hour: CLOSE_HOUR, minute: 0, second: 0, millisecond: 0 });\n\n  while (cursor.plus({ minutes: durationMin }) <= close) {\n    if (cursor >= earliest && isBookable(cursor, durationMin, busy)) {\n      out.push(cursor);\n    }\n    cursor = cursor.plus({ minutes: SLOT_GRID_MIN });\n  }\n  return out;\n}\n\nconst fmtTime = (dt) => dt.toFormat('HH:mm');\nconst fmtDate = (dt) => dt.toFormat('cccc d LLLL');\n\n// ── MAIN ──────────────────────────────────────────────────────────────\n\nconst req = $('Classify Intent').first().json;\nconst now = DateTime.now().setZone(TZ);\nconst parsed = parseEvents($input.all());\nconst busy = parsed.busy;\nconst hasAllDay = parsed.hasAllDay;\n\nconst out = (decision, extra) => [{\n  json: Object.assign(\n    { decision: decision, treatment: req.treatment || null },\n    extra || {}\n  ),\n}];\n\n// Rule 4 of the classifier makes these mutually exclusive, so both being set\n// is impossible by construction. If it happens the model output is not what\n// it appears to be, and acting on it is unsafe.\nif (req.requested_start && req.requested_date) {\n  return out('escalate', { reason: 'impossible_flag_combination' });\n}\n\nconst durationMin = DURATIONS[req.treatment];\nif (!durationMin) {\n  return out('escalate', { reason: 'unknown_treatment' });\n}\n\n// Ambiguous calendar entry in the window. Default when unsure is ASK.\nif (hasAllDay) {\n  return out('escalate', { reason: 'all_day_event_in_window' });\n}\n\n// ── exact time requested ──\nif (req.requested_start) {\n  const start = DateTime.fromISO(req.requested_start, { zone: TZ });\n  if (!start.isValid) {\n    return out('escalate', { reason: 'unparseable_start' });\n  }\n\n  if (isBookable(start, durationMin, busy)) {\n    const treatmentEnd = start.plus({ minutes: durationMin });\n    return out('slot_available', {\n      start_iso: start.toISO(),\n      end_iso: treatmentEnd.toISO(),\n      start_human: fmtDate(start) + ' at ' + fmtTime(start),\n      duration_min: durationMin,\n    });\n  }\n\n  // Busy: offer nearest same-day alternatives rather than a bare no.\n  const alternatives = openSlots(start.startOf('day'), durationMin, busy, now)\n    .sort((a, b) =>\n      Math.abs(a.diff(start).toMillis()) - Math.abs(b.diff(start).toMillis()))\n    .slice(0, MAX_OFFERS)\n    .sort((a, b) => a.toMillis() - b.toMillis());\n\n  return out(alternatives.length ? 'slot_busy' : 'day_full', {\n    requested_human: fmtDate(start) + ' at ' + fmtTime(start),\n    date_human: fmtDate(start),\n    duration_min: durationMin,\n    offers: alternatives.map((s) => ({ iso: s.toISO(), human: fmtTime(s) })),\n  });\n}\n\n// ── date only, no clock time ──\nif (req.requested_date) {\n  const day = DateTime.fromISO(req.requested_date, { zone: TZ });\n  if (!day.isValid) {\n    return out('escalate', { reason: 'unparseable_date' });\n  }\n\n  const slots = openSlots(day.startOf('day'), durationMin, busy, now)\n    .slice(0, MAX_OFFERS);\n\n  return out(slots.length ? 'day_slots' : 'day_full', {\n    date_human: fmtDate(day),\n    duration_min: durationMin,\n    offers: slots.map((s) => ({ iso: s.toISO(), human: fmtTime(s) })),\n  });\n}\n\n// The router upstream should have caught this. Fail to ASK, not to ACT.\nreturn out('escalate', { reason: 'no_date_supplied' });"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        256,
+        -80
+      ],
+      "id": "b2a24ce8-664b-4510-8da6-410043d8248e",
+      "name": "Check Availability"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "slot_available",
+                    "rightValue": "={{ $json.decision }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "9aafe83d-9e8b-48f1-b335-9d89e6ca8058"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Book"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "67b4104f-02e5-49be-934d-fe98e91ef844",
+                    "leftValue": "slot_busy",
+                    "rightValue": "={{ $json.decision }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Offer alternatives"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "c4244053-8e03-4210-9573-76acf382b070",
+                    "leftValue": "day_slots",
+                    "rightValue": "={{ $json.decision }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Offer alternatives"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "0084665d-093a-40aa-8188-41ee94fb26fe",
+                    "leftValue": "day_full",
+                    "rightValue": "={{ $json.decision }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Day full"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "5eaeb6d8-acd0-4fa0-a02b-f68ea206fa50",
+                    "leftValue": "escalate",
+                    "rightValue": "={{ $json.decision }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Escalate"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        384,
+        -240
+      ],
+      "id": "cb0442f6-89da-47be-8553-ddbc89bcad04",
+      "name": "Route Decision"
+    },
+    {
+      "parameters": {
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_CALENDAR_ID@group.calendar.google.com",
+          "__regex": "(^[a-zA-Z0-9.!#$%&’*+/=?^_`{|}~-]+@[a-zA-Z0-9-]+(?:\\.[a-zA-Z0-9-]+)*)"
+        },
+        "start": "={{ $('Route Decision').first().json.start_iso }}",
+        "end": "={{ $('Route Decision').first().json.end_iso }}",
+        "additionalFields": {
+          "summary": "={{ $('Classify Intent').first().json.client_name }} — {{ $('Route Decision').first().json.treatment }}"
+        }
+      },
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1104,
+        -240
+      ],
+      "id": "108679bc-cb87-4fca-b98b-b76d91cfc571",
+      "name": "Create an event",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "0Wucv0xsPCugvJr8",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://your-api-host.example.com/bookings",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"client_name\": \"{{ $('Classify Intent').first().json.client_name }}\",\n  \"client_email\": \"{{ $('Classify Intent').first().json.client_email }}\",\n  \"treatment\": \"{{ $('Route Decision').first().json.treatment }}\",\n  \"starts_at\": \"{{ $('Route Decision').first().json.start_iso }}\",\n  \"ends_at\": \"{{ $('Route Decision').first().json.end_iso }}\",\n  \"calendar_event_id\": \"{{ $json.id }}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1296,
+        -240
+      ],
+      "id": "31b91ad2-a1f4-4f4f-8601-41b77af14204",
+      "name": "Create Booking",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "bUPVkc7A2voA4Sny",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const booking = $input.first().json;          // {id, booking_ref}\nconst slot = $('Route Decision').first().json;\nconst req = $('Classify Intent').first().json;\n\nconst ref = booking.booking_ref;\nconst name = req.client_name || 'there';\n\n// The ref must survive being quoted in a reply: the cancel/reschedule path\n// regex-extracts it from the FULL body, quoted text included. Keep it on its\n// own line, unstyled, no markup that could split the token.\nconst body = [\n  `Hi ${name},`,\n  ``,\n  `Your booking is confirmed.`,\n  ``,\n  `  ${slot.start_human}`,\n  `  ${slot.treatment} (${slot.duration_min} minutes)`,\n  ``,\n  `Booking reference: ${ref}`,\n  ``,\n  `To change or cancel, just reply to this email and quote your booking`,\n  `reference above. Please give us at least 24 hours' notice.`,\n  ``,\n  `Payment is on arrival.`,\n  ``,\n  `See you soon,`,\n  `Chiang Mai Wellness Retreat`,\n].join('\\n');\n\nreturn [{\n  json: {\n    booking_ref: ref,\n    to: req.client_email || 'nan@example.com',\n    subject: `Booking confirmed — ${slot.start_human} (${ref})`,\n    body: body,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1504,
+        -208
+      ],
+      "id": "ed9849b6-1113-4b69-9fcf-caafdf049207",
+      "name": "Compose Confirmation"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.body }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1744,
+        -224
+      ],
+      "id": "7eb6250b-db32-46e0-af9d-7e9eb850ef79",
+      "name": "Send Confirmation",
+      "webhookId": "d5107642-d0fe-422c-b600-1c79b0bdfe26",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "4byPKNOedREFDdwS",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://your-api-host.example.com/bookings/lookup",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $('Classify Intent').first().json.client_email }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        592,
+        -320
+      ],
+      "id": "08b81f66-552a-4457-9a46-5af08e0fb1d8",
+      "name": "Check Duplicate",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "bUPVkc7A2voA4Sny",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const requested = DateTime.fromISO($('Route Decision').first().json.start_iso);\nconst found = $input.first().json.bookings || [];\n\n// The API returns starts_at in UTC with a space separator\n// (\"2026-08-05 07:00:00+00:00\"); the request carries +07:00. Same instant,\n// different text - compare instants, never strings, or this guard silently\n// never matches and looks like it is working.\nconst parse = (s) => DateTime.fromISO(String(s).replace(' ', 'T'));\n\nconst dup = found.find(\n  (b) => parse(b.starts_at).toMillis() === requested.toMillis()\n);\n\nreturn [{\n  json: {\n    is_duplicate: Boolean(dup),\n    existing_ref: dup ? dup.booking_ref : null,\n    checked_count: found.length,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        736,
+        -272
+      ],
+      "id": "8b7027a3-7e2f-4a9d-bb1f-dee6c3674d85",
+      "name": "Detect Duplicate"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "cfc024dd-a2c7-44f2-b045-317638c2d52d",
+              "leftValue": "={{ $json.is_duplicate }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        896,
+        -320
+      ],
+      "id": "613839a7-abc2-403d-aeca-3a0b5596c21b",
+      "name": "Is Duplicate?"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Classify Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Intent": {
+      "main": [
+        [
+          {
+            "node": "Calendar Events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calendar Events": {
+      "main": [
+        [
+          {
+            "node": "Check Availability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Availability": {
+      "main": [
+        [
+          {
+            "node": "Route Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Decision": {
+      "main": [
+        [
+          {
+            "node": "Check Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create an event": {
+      "main": [
+        [
+          {
+            "node": "Create Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Booking": {
+      "main": [
+        [
+          {
+            "node": "Compose Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Send Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Detect Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Is Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Create an event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "nodeGroups": [],
+  "tags": []
+}
