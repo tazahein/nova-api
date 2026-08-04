@@ -94,9 +94,19 @@ calendar event means one therapist occupied. Staff meetings, room closures, and
 holidays break that assumption. Unanswered by the client, which is why all-day
 events currently escalate to a human rather than resolving.
 
-**Known non-atomicity:** the duplicate guard is check-then-act, not transactional.
-Two polls in the same minute can both read zero and both book. This is a known and
-accepted v1 limitation, not a bug to fix opportunistically.
+**Known non-atomicity, and what actually backstops it:** the duplicate guard in n8n
+is check-then-act, not transactional — two polls in the same minute can both read
+zero and both book. The database backstop is the `no_therapist_overlap` constraint
+on `bookings` (`EXCLUDE USING gist (therapist WITH =, tstzrange(starts_at, ends_at)
+WITH &&) WHERE status = 'confirmed'`), which rejects overlapping confirmed bookings
+for the same therapist atomically. Where it applies, that race cannot happen.
+
+The gap is `therapist IS NULL`. Two NULLs do not compare equal, so NULL-therapist
+rows never conflict with each other and the constraint never fires. v1 assigns no
+therapist — `main.py` omits the column on both inserts — so **every row today is
+NULL and the check-then-act race is fully live.** The constraint is protection for
+the version that assigns therapists, not for the one running now. Accepted v1
+limitation, not a bug to fix opportunistically.
 
 ## Ops trivia worth not rediscovering
 
@@ -108,5 +118,9 @@ accepted v1 limitation, not a bug to fix opportunistically.
 - n8n serves cached upstream output when you run a single node, so downstream nodes
   can read values from an earlier run. A node that looks fixed in isolation can
   still be broken on a full run — re-run the whole workflow before believing it.
+- `POSTGRES_USER` is not declared in `docker-compose.yml`, so Postgres falls back to
+  its default of `postgres`. The variable does not exist inside the container, so
+  `psql -U "$POSTGRES_USER"` expands to an empty user and fails. Use `psql -U
+  postgres` — the healthcheck and `DATABASE_URL` both hardcode it already.
 - Postgres `SERIAL` ids do not reuse after `DELETE`. Gaps in id sequences are
   expected and not evidence of data loss.
