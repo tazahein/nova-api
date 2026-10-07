@@ -15,7 +15,9 @@ def client(monkeypatch):
     return TestClient(main.app)
 
 
-def test_health_check(client):
+def test_health_check(client, monkeypatch):
+    monkeypatch.setattr(main, "API_KEY", None)
+
     response = client.get("/")
 
     assert response.status_code == 200
@@ -26,6 +28,9 @@ def test_health_check(client):
 @pytest.mark.parametrize(
     "method,path,kwargs",
     [
+        ("get", "/contacts", {}),
+        ("get", "/customers/1/orders", {}),
+        ("get", "/portal/summary", {}),
         ("get", "/inquiries/dedupe?sender=lead@example.com", {}),
         (
             "post",
@@ -79,15 +84,52 @@ def test_protected_endpoints_reject_missing_or_wrong_key(
     assert response.json() == {"detail": "Invalid or missing API key"}
 
 
-def test_missing_server_key_fails_closed(client, monkeypatch):
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/contacts",
+        "/customers/1/orders",
+        "/portal/summary",
+        "/inquiries/dedupe?sender=lead@example.com",
+    ],
+)
+def test_missing_server_key_fails_closed(client, monkeypatch, path):
     monkeypatch.setattr(main, "API_KEY", None)
 
+    def unexpected_connection(*args, **kwargs):
+        pytest.fail("Authentication must fail before opening a database connection")
+
+    monkeypatch.setattr(main.psycopg, "connect", unexpected_connection)
+
     response = client.get(
-        "/inquiries/dedupe?sender=lead@example.com",
+        path,
         headers={"x-api-key": "test-api-key"},
     )
 
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/contacts", {"contacts": []}),
+        ("/customers/1/orders", {"customer_id": 1, "orders": []}),
+        ("/portal/summary", {"summary": []}),
+    ],
+)
+def test_valid_key_allows_crm_reads(client, monkeypatch, path, expected):
+    connection = MagicMock()
+    cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = (1,)
+    cursor.fetchall.return_value = []
+    connect = MagicMock(return_value=connection)
+    monkeypatch.setattr(main.psycopg, "connect", connect)
+
+    response = client.get(path, headers={"x-api-key": "test-api-key"})
+
+    assert response.status_code == 200
+    assert response.json() == expected
+    connect.assert_called_once_with(main.DB)
 
 
 def test_valid_key_allows_dedupe_request(client, monkeypatch):

@@ -14,7 +14,7 @@ API_KEY = os.environ.get("NOVA_API_KEY")
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)):
-    # Fail CLOSED: if the env var is missing, everything 401s.
+    # Fail closed on protected routes when the key is not configured.
     if not API_KEY or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
@@ -91,7 +91,7 @@ FROM chain ORDER BY (status = 'confirmed') DESC, id DESC LIMIT 1;
 def home():
     return {"message": "nova-api is alive"}
 
-@app.get("/contacts")
+@app.get("/contacts", dependencies=[Depends(require_api_key)])
 def list_contacts():
     with psycopg.connect(DB) as conn:
         with conn.cursor() as cur:
@@ -107,7 +107,7 @@ def list_contacts():
         ]
     }
 
-@app.get("/customers/{customer_id}/orders")
+@app.get("/customers/{customer_id}/orders", dependencies=[Depends(require_api_key)])
 def customer_orders(customer_id: int):
     with psycopg.connect(DB) as conn:
         with conn.cursor() as cur:
@@ -132,7 +132,7 @@ def customer_orders(customer_id: int):
         ]
     }
 
-@app.get("/portal/summary")
+@app.get("/portal/summary", dependencies=[Depends(require_api_key)])
 def portal_summary():
     with psycopg.connect(DB) as conn:
         with conn.cursor() as cur:

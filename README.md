@@ -31,10 +31,10 @@ Configuration values:
 | Variable | Read by | Purpose |
 |----------|---------|---------|
 | `DATABASE_URL` | API | PostgreSQL connection string. If unset, the app uses `dbname=nova_crm` and libpq connection defaults; set it explicitly for TCP connections. |
-| `NOVA_API_KEY` | API | Key clients send in the `X-API-Key` header for inquiry and booking endpoints. If unset or empty, those endpoints return 401. |
+| `NOVA_API_KEY` | API | Key clients send in the `X-API-Key` header for every database-backed endpoint. If unset or empty, those endpoints return 401. |
 | `POSTGRES_PASSWORD` | Docker Compose | Password for PostgreSQL; Compose also puts it in the API's `DATABASE_URL`. |
 
-The health and CRM endpoints do not currently require an API key. The app does not load `.env` itself; direct Python runs need environment variables set in the shell.
+The health endpoint and API documentation are public; all database-backed endpoints require an API key. The app does not load `.env` itself; direct Python runs need environment variables set in the shell.
 
 For Docker Compose, copy `.env.example` to `.env` in this directory and set both values. Compose reads them for interpolation and passes the resulting values to the containers. Keep `.env` private (`.gitignore` excludes it). The Compose file also needs `nova-crm-postgresql` as a sibling directory for its SQL initialization files.
 
