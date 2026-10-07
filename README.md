@@ -4,7 +4,7 @@ FastAPI connection layer over the [nova_crm PostgreSQL database](https://github.
 
 The database repo builds the schema (contacts → leads → customers → orders); this repo exposes it as a JSON API.
 
-**Live demo:** https://novatayza.duckdns.org ([interactive docs](https://novatayza.duckdns.org/docs))
+**Public demo:** Currently unavailable. Run the API locally to use its interactive docs at `/docs`.
 
 ## Endpoints
 
@@ -34,6 +34,13 @@ Requires PostgreSQL running locally with the `nova_crm` database (build it from 
     uvicorn main:app --reload
 
 Server runs at http://127.0.0.1:8000.
+
+## Run tests
+
+The API contract tests run without a PostgreSQL server:
+
+    python -m pip install -r requirements-dev.txt
+    python -m pytest tests -q
 
 ## Run with Docker
 
