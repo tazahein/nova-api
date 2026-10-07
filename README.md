@@ -24,14 +24,39 @@ Interactive docs with full response schemas at `/docs` once running.
 - **Pydantic response models** — every data endpoint declares its response shape. Output is validated, `Decimal` → `float` conversion is automatic, and `/docs` is self-documenting.
 - **FastAPI's type-hinted path params** — `customer_id: int` rejects non-numeric input at the door before any code runs.
 
+## Configuration
+
+Configuration values:
+
+| Variable | Read by | Purpose |
+|----------|---------|---------|
+| `DATABASE_URL` | API | PostgreSQL connection string. If unset, the app uses `dbname=nova_crm` and libpq connection defaults; set it explicitly for TCP connections. |
+| `NOVA_API_KEY` | API | Key clients send in the `X-API-Key` header for inquiry and booking endpoints. If unset or empty, those endpoints return 401. |
+| `POSTGRES_PASSWORD` | Docker Compose | Password for PostgreSQL; Compose also puts it in the API's `DATABASE_URL`. |
+
+The health and CRM endpoints do not currently require an API key. The app does not load `.env` itself; direct Python runs need environment variables set in the shell.
+
+For Docker Compose, copy `.env.example` to `.env` in this directory and set both values. Compose reads them for interpolation and passes the resulting values to the containers. Keep `.env` private (`.gitignore` excludes it). The Compose file also needs `nova-crm-postgresql` as a sibling directory for its SQL initialization files.
+
 ## Run locally
 
 Requires PostgreSQL running locally with the `nova_crm` database (build it from the [SQL repo](https://github.com/tazahein/nova-crm-postgresql)).
 
-    python3 -m venv venv
-    source venv/bin/activate
-    pip install -r requirements.txt
-    uvicorn main:app --reload
+On Windows PowerShell:
+
+    py -3.12 -m venv venv
+    .\venv\Scripts\python.exe -m pip install -r requirements.txt
+    $env:DATABASE_URL = "host=localhost dbname=nova_crm user=postgres password=<db-password>"
+    $env:NOVA_API_KEY = "<long-random-key>"
+    .\venv\Scripts\python.exe -m uvicorn main:app --reload
+
+On macOS/Linux:
+
+    python3.12 -m venv venv
+    venv/bin/python -m pip install -r requirements.txt
+    export DATABASE_URL="host=localhost dbname=nova_crm user=postgres password=<db-password>"
+    export NOVA_API_KEY="<long-random-key>"
+    venv/bin/python -m uvicorn main:app --reload
 
 Server runs at http://127.0.0.1:8000.
 
@@ -55,24 +80,21 @@ Dependencies are installed in their own layer before the application
 code is copied, so rebuilds after code-only changes reuse the cached
 pip install and complete in seconds.
 
-Run the container:
+Set `DATABASE_URL` in your shell with `host=host.docker.internal` instead of `host=localhost`, and set `NOVA_API_KEY` there too. Then pass both to the container (the example uses a POSIX shell):
 
     docker run -d --name nova-api -p 8000:8000 \
-      -e DATABASE_URL="host=host.docker.internal dbname=nova_crm user=<your-postgres-user>" \
+      -e DATABASE_URL -e NOVA_API_KEY \
       nova-api
 
 Then visit http://localhost:8000/docs for the interactive API docs.
 
 Notes:
 
-- DATABASE_URL is read from the environment (see main.py). If it is
-  not set, the app falls back to a local socket connection
-  (dbname=nova_crm), so running outside Docker works unchanged.
-- host.docker.internal is Docker Desktop's hostname for the host
+- `host.docker.internal` is Docker Desktop's hostname for the host
   machine — localhost inside a container refers to the container
   itself, not the host.
-- The username must be passed explicitly: TCP connections don't
-  inherit your OS username the way local socket connections do.
+- Include a database user and password in `DATABASE_URL` when PostgreSQL
+  requires them. `-e NAME` forwards that variable from the host shell.
 - The server binds to 0.0.0.0 inside the container; binding to
   127.0.0.1 would make it unreachable from the host even with -p.
 
