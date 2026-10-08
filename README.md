@@ -119,3 +119,5 @@ Runs on a cloud VPS as a Docker Compose stack (see `docker-compose.yml`)
 behind an Nginx reverse proxy with Let's Encrypt HTTPS. The API container
 binds to loopback only; Nginx is the sole public entry point. The proxy
 config and a restore guide live in [`deploy/nginx/`](deploy/nginx/).
+The booking database migration and live n8n update have a
+[deployment runbook](deploy/booking-rollout.md) with verification and rollback gates.
