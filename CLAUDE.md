@@ -102,11 +102,11 @@ WITH &&) WHERE status = 'confirmed'`), which rejects overlapping confirmed booki
 for the same therapist atomically. Where it applies, that race cannot happen.
 
 The gap is `therapist IS NULL`. Two NULLs do not compare equal, so NULL-therapist
-rows never conflict with each other and the constraint never fires. v1 assigns no
-therapist — `main.py` omits the column on both inserts — so **every row today is
-NULL and the check-then-act race is fully live.** The constraint is protection for
-the version that assigns therapists, not for the one running now. Accepted v1
-limitation, not a bug to fix opportunistically.
+rows never conflict under `no_therapist_overlap`. Booking writes now also use a
+unique calendar event ID, a unique successor per booking, and `no_client_overlap`
+to prevent confirmed bookings for the same client at overlapping times. Different
+clients can still reserve the same time when no therapist is assigned, so the
+availability workflow remains the capacity check for those requests.
 
 ## Ops trivia worth not rediscovering
 

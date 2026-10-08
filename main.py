@@ -87,6 +87,37 @@ FROM chain ORDER BY (status = 'confirmed') DESC, id DESC LIMIT 1;
 """
 
 
+_RESCHEDULE_REPLAY = """
+WITH RECURSIVE chain AS (
+    SELECT id FROM bookings WHERE booking_ref = %s
+  UNION ALL
+    SELECT b.id FROM bookings b JOIN chain c ON b.supersedes_id = c.id
+)
+SELECT b.booking_ref, previous.booking_ref, previous.calendar_event_id,
+       b.client_email = %s AND b.starts_at = %s
+       AND b.ends_at = %s AND b.status = 'confirmed'
+       AND previous.id IN (SELECT id FROM chain)
+FROM bookings b
+LEFT JOIN bookings previous ON previous.id = b.supersedes_id
+WHERE b.calendar_event_id = %s;
+"""
+
+
+def _replayed_reschedule(cur, ref: str, body: RescheduleIn):
+    cur.execute(
+        _RESCHEDULE_REPLAY,
+        (ref, body.client_email, body.starts_at, body.ends_at,
+         body.calendar_event_id),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    if row[3] is not True:
+        raise HTTPException(status_code=409, detail="Calendar event conflicts with a booking")
+    return {"booking_ref": row[0], "previous_ref": row[1],
+            "old_calendar_event_id": row[2]}
+
+
 @app.get("/")
 def home():
     return {"message": "nova-api is alive"}
@@ -198,8 +229,7 @@ def create_inquiry(inq: InquiryIn):
 @app.post("/bookings", status_code=201, dependencies=[Depends(require_api_key)])
 def create_booking(b: BookingIn):
     # Calendar event is created by the workflow first, so its ID exists
-    # here. If this insert fails we orphan a calendar event (a blocked
-    # slot) rather than lose a confirmed booking.
+    # here. A replay of the same event returns the original booking.
     ref = _new_ref()
     with psycopg.connect(DB) as conn:
         with conn.cursor() as cur:
@@ -208,11 +238,27 @@ def create_booking(b: BookingIn):
                 "(booking_ref, client_email, client_name, treatment, "
                 " starts_at, ends_at, calendar_event_id, thread_id) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
-                "RETURNING id, booking_ref;",
+                "ON CONFLICT DO NOTHING RETURNING id, booking_ref;",
                 (ref, b.client_email, b.client_name, b.treatment,
                  b.starts_at, b.ends_at, b.calendar_event_id, b.thread_id),
             )
             row = cur.fetchone()
+            if row is None:
+                cur.execute(
+                    "SELECT id, booking_ref FROM bookings "
+                    "WHERE calendar_event_id = %s AND client_email = %s "
+                    "AND client_name IS NOT DISTINCT FROM %s "
+                    "AND treatment = %s AND starts_at = %s AND ends_at = %s "
+                    "AND thread_id IS NOT DISTINCT FROM %s "
+                    "AND supersedes_id IS NULL AND status = 'confirmed';",
+                    (b.calendar_event_id, b.client_email, b.client_name,
+                     b.treatment, b.starts_at, b.ends_at, b.thread_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise HTTPException(
+                        status_code=409, detail="Booking conflicts with an existing booking"
+                    )
     return {"id": row[0], "booking_ref": row[1]}
 
 
@@ -281,15 +327,30 @@ def cancel_booking(ref: str, body: CancelIn):
 @app.post("/bookings/{ref}/reschedule", dependencies=[Depends(require_api_key)])
 def reschedule_booking(ref: str, body: RescheduleIn):
     # Called only after the NEW calendar event exists and is confirmed.
-    # Insert-then-supersede in one transaction: both or neither.
+    # Claim the current row before creating its successor, in one transaction.
     new_ref = _new_ref()
     with psycopg.connect(DB) as conn:
         with conn.cursor() as cur:
+            replay = _replayed_reschedule(cur, ref, body)
+            if replay is not None:
+                return replay
             cur.execute(_RESOLVE, (ref,))
             old = cur.fetchone()
             if (old is None or old[2].lower() != body.client_email.lower()
                     or old[7] != "confirmed"):
                 raise HTTPException(status_code=404, detail="Booking not found")
+            cur.execute(
+                "UPDATE bookings SET status = 'superseded' "
+                "WHERE id = %s AND status = 'confirmed' RETURNING id;",
+                (old[0],),
+            )
+            if cur.fetchone() is None:
+                replay = _replayed_reschedule(cur, ref, body)
+                if replay is not None:
+                    return replay
+                raise HTTPException(
+                    status_code=409, detail="Booking was changed by another request"
+                )
             cur.execute(
                 "INSERT INTO bookings "
                 "(booking_ref, client_email, client_name, treatment, "
@@ -297,15 +358,16 @@ def reschedule_booking(ref: str, body: RescheduleIn):
                 " supersedes_id) "
                 "SELECT %s, client_email, client_name, treatment, "
                 " %s, %s, %s, thread_id, id "
-                "FROM bookings WHERE id = %s RETURNING booking_ref;",
+                "FROM bookings WHERE id = %s "
+                "ON CONFLICT DO NOTHING RETURNING booking_ref;",
                 (new_ref, body.starts_at, body.ends_at,
                  body.calendar_event_id, old[0]),
             )
-            created = cur.fetchone()[0]
-            cur.execute(
-                "UPDATE bookings SET status = 'superseded' WHERE id = %s;",
-                (old[0],),
-            )
-    return {"booking_ref": created,
+            created = cur.fetchone()
+            if created is None:
+                raise HTTPException(
+                    status_code=409, detail="Booking conflicts with an existing booking"
+                )
+    return {"booking_ref": created[0],
             "previous_ref": old[1],
             "old_calendar_event_id": old[6]}

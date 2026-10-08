@@ -36,6 +36,8 @@ Configuration values:
 
 The health endpoint and API documentation are public; all database-backed endpoints require an API key. The app does not load `.env` itself; direct Python runs need environment variables set in the shell.
 
+Booking creation and rescheduling use `calendar_event_id` to recognize a repeated request. A matching replay returns the original booking reference; reuse with different details or a conflicting client booking returns HTTP 409. Apply `migrations/001-booking-idempotency.sql` from the sibling `nova-crm-postgresql` repository to existing databases before running this API version. New databases get the constraints from `05-bookings.sql`.
+
 For Docker Compose, copy `.env.example` to `.env` in this directory and set both values. Compose reads them for interpolation and passes the resulting values to the containers. Keep `.env` private (`.gitignore` excludes it). The Compose file also needs `nova-crm-postgresql` as a sibling directory for its SQL initialization files.
 
 ## Run locally
