@@ -234,7 +234,16 @@
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={\n  \"client_name\": \"{{ $('Classify Intent').first().json.client_name }}\",\n  \"client_email\": \"{{ $('Classify Intent').first().json.client_email }}\",\n  \"treatment\": \"{{ $('Route Decision').first().json.treatment }}\",\n  \"starts_at\": \"{{ $('Route Decision').first().json.start_iso }}\",\n  \"ends_at\": \"{{ $('Route Decision').first().json.end_iso }}\",\n  \"calendar_event_id\": \"{{ $json.id }}\"\n}",
-        "options": {}
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
       },
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
@@ -249,17 +258,18 @@
           "id": "bUPVkc7A2voA4Sny",
           "name": "Header Auth account"
         }
-      }
+      },
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const booking = $input.first().json;          // {id, booking_ref}\nconst slot = $('Route Decision').first().json;\nconst req = $('Classify Intent').first().json;\n\nconst ref = booking.booking_ref;\nconst name = req.client_name || 'there';\n\n// The ref must survive being quoted in a reply: the cancel/reschedule path\n// regex-extracts it from the FULL body, quoted text included. Keep it on its\n// own line, unstyled, no markup that could split the token.\nconst body = [\n  `Hi ${name},`,\n  ``,\n  `Your booking is confirmed.`,\n  ``,\n  `  ${slot.start_human}`,\n  `  ${slot.treatment} (${slot.duration_min} minutes)`,\n  ``,\n  `Booking reference: ${ref}`,\n  ``,\n  `To change or cancel, just reply to this email and quote your booking`,\n  `reference above. Please give us at least 24 hours' notice.`,\n  ``,\n  `Payment is on arrival.`,\n  ``,\n  `See you soon,`,\n  `Chiang Mai Wellness Retreat`,\n].join('\\n');\n\nreturn [{\n  json: {\n    booking_ref: ref,\n    to: req.client_email || 'nan@example.com',\n    subject: `Booking confirmed — ${slot.start_human} (${ref})`,\n    body: body,\n  },\n}];"
+        "jsCode": "const booking = $input.first().json.body;     // {id, booking_ref}\nconst slot = $('Route Decision').first().json;\nconst req = $('Classify Intent').first().json;\n\nconst ref = booking.booking_ref;\nconst name = req.client_name || 'there';\n\n// The ref must survive being quoted in a reply: the cancel/reschedule path\n// regex-extracts it from the FULL body, quoted text included. Keep it on its\n// own line, unstyled, no markup that could split the token.\nconst body = [\n  `Hi ${name},`,\n  ``,\n  `Your booking is confirmed.`,\n  ``,\n  `  ${slot.start_human}`,\n  `  ${slot.treatment} (${slot.duration_min} minutes)`,\n  ``,\n  `Booking reference: ${ref}`,\n  ``,\n  `To change or cancel, just reply to this email and quote your booking`,\n  `reference above. Please give us at least 24 hours' notice.`,\n  ``,\n  `Payment is on arrival.`,\n  ``,\n  `See you soon,`,\n  `Chiang Mai Wellness Retreat`,\n].join('\\n');\n\nreturn [{\n  json: {\n    booking_ref: ref,\n    to: req.client_email || 'nan@example.com',\n    subject: `Booking confirmed — ${slot.start_human} (${ref})`,\n    body: body,\n  },\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1504,
-        -208
+        1696,
+        -352
       ],
       "id": "ed9849b6-1113-4b69-9fcf-caafdf049207",
       "name": "Compose Confirmation"
@@ -275,8 +285,8 @@
       "type": "n8n-nodes-base.gmail",
       "typeVersion": 2.2,
       "position": [
-        1744,
-        -224
+        1904,
+        -352
       ],
       "id": "7eb6250b-db32-46e0-af9d-7e9eb850ef79",
       "name": "Send Confirmation",
@@ -365,6 +375,197 @@
       ],
       "id": "613839a7-abc2-403d-aeca-3a0b5596c21b",
       "name": "Is Duplicate?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "7884b87e-33a2-40e0-8ca2-f2aa06a6d2dd",
+              "leftValue": "={{ $json.statusCode === 201 && !!$json.body && !!$json.body.booking_ref }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1488,
+        -240
+      ],
+      "id": "4dbfc2a5-8a05-4cb9-b958-4ef70d43c96d",
+      "name": "Booking Saved?"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "bad68c05-dfdc-4755-8335-e5d0002a9054",
+              "leftValue": "={{ $json.statusCode === 409 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1696,
+        -80
+      ],
+      "id": "caa483b0-4b23-42a9-8f3a-b43e19765e70",
+      "name": "Booking Conflict?"
+    },
+    {
+      "parameters": {
+        "url": "https://your-api-host.example.com/bookings/by-calendar-event",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "event_id",
+              "value": "={{ $('Create an event').first().json.id }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1904,
+        -80
+      ],
+      "id": "05cdba6d-f20d-4ace-a021-b329b65f7893",
+      "name": "Find Event Booking",
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "bUPVkc7A2voA4Sny",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "5c7076f7-8409-4aef-938f-cf3f8b41b53d",
+              "leftValue": "={{ $json.found === false }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2112,
+        -80
+      ],
+      "id": "df5f85ff-6a0f-4d77-b4f9-d306cf0d79d6",
+      "name": "Event Unreferenced?"
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_CALENDAR_ID@group.calendar.google.com",
+          "__regex": "(^[a-zA-Z0-9.!#$%&’*+/=?^_`{|}~-]+@[a-zA-Z0-9-]+(?:\\.[a-zA-Z0-9-]+)*)"
+        },
+        "eventId": "={{ $('Create an event').first().json.id }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        2320,
+        -80
+      ],
+      "id": "66bd05cb-e3f8-4f61-b2a3-df0884a55f5f",
+      "name": "Delete Rejected Event",
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "0Wucv0xsPCugvJr8",
+          "name": "Google Calendar account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const eventId = $('Create an event').first().json.id;\nthrow new Error('Booking outcome needs manual reconciliation. Verify calendar event ' + eventId + ' and its booking record before retrying or cleaning up.');"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2528,
+        224
+      ],
+      "id": "8536cbd6-4e21-409e-ad7a-33e035e0c7ba",
+      "name": "Manual Review Required"
+    },
+    {
+      "parameters": {
+        "jsCode": "const eventId = $('Create an event').first().json.id;\nthrow new Error('Booking rejected with HTTP 409. Calendar event ' + eventId + ' was removed. Contact the client to arrange another time.');"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2528,
+        -80
+      ],
+      "id": "cf5a2b5e-c9e0-4005-8e3b-c7abc876a14a",
+      "name": "Conflict Needs Client Reply"
     }
   ],
   "pinData": {},
@@ -439,7 +640,14 @@
       "main": [
         [
           {
-            "node": "Compose Confirmation",
+            "node": "Booking Saved?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Manual Review Required",
             "type": "main",
             "index": 0
           }
@@ -485,6 +693,96 @@
         [
           {
             "node": "Create an event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Booking Saved?": {
+      "main": [
+        [
+          {
+            "node": "Compose Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Booking Conflict?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Booking Conflict?": {
+      "main": [
+        [
+          {
+            "node": "Find Event Booking",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Manual Review Required",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Event Booking": {
+      "main": [
+        [
+          {
+            "node": "Event Unreferenced?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Manual Review Required",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Event Unreferenced?": {
+      "main": [
+        [
+          {
+            "node": "Delete Rejected Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Manual Review Required",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Rejected Event": {
+      "main": [
+        [
+          {
+            "node": "Conflict Needs Client Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Manual Review Required",
             "type": "main",
             "index": 0
           }

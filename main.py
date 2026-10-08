@@ -299,6 +299,25 @@ def lookup_bookings(email: str, ref: str | None = None):
     }
 
 
+@app.get("/bookings/by-calendar-event", dependencies=[Depends(require_api_key)])
+def booking_by_calendar_event(event_id: str):
+    # Reconciliation must include historical rows: an event linked to any
+    # booking is never safe for the workflow to delete automatically.
+    with psycopg.connect(DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT booking_ref, status FROM bookings "
+                "WHERE calendar_event_id = %s;",
+                (event_id,),
+            )
+            row = cur.fetchone()
+    return {
+        "found": row is not None,
+        "booking_ref": row[0] if row else None,
+        "status": row[1] if row else None,
+    }
+
+
 @app.patch("/bookings/{ref}/cancel", dependencies=[Depends(require_api_key)])
 def cancel_booking(ref: str, body: CancelIn):
     with psycopg.connect(DB) as conn:

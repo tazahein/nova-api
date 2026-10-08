@@ -1,5 +1,7 @@
 """Checks for API behavior that must not depend on a running database."""
 
+import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -42,6 +44,7 @@ def test_health_check(client, monkeypatch):
             }},
         ),
         ("get", "/bookings/lookup?email=client@example.com", {}),
+        ("get", "/bookings/by-calendar-event?event_id=event-1", {}),
         (
             "post",
             "/bookings",
@@ -91,6 +94,7 @@ def test_protected_endpoints_reject_missing_or_wrong_key(
         "/customers/1/orders",
         "/portal/summary",
         "/inquiries/dedupe?sender=lead@example.com",
+        "/bookings/by-calendar-event?event_id=event-1",
     ],
 )
 def test_missing_server_key_fails_closed(client, monkeypatch, path):
@@ -151,6 +155,35 @@ def test_valid_key_allows_dedupe_request(client, monkeypatch):
     }
     connect.assert_called_once_with(main.DB)
     assert cursor.execute.call_args.args[1] == ("lead@example.com",)
+
+
+@pytest.mark.parametrize(
+    "row,expected",
+    [
+        (None, {"found": False, "booking_ref": None, "status": None}),
+        (("CMW-old", "superseded"),
+         {"found": True, "booking_ref": "CMW-old", "status": "superseded"}),
+    ],
+)
+def test_calendar_event_lookup_includes_historical_bookings(
+    client, monkeypatch, row, expected
+):
+    connection = MagicMock()
+    cursor = connection.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = row
+    connect = MagicMock(return_value=connection)
+    monkeypatch.setattr(main.psycopg, "connect", connect)
+
+    response = client.get(
+        "/bookings/by-calendar-event?event_id=event-1",
+        headers={"x-api-key": "test-api-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == expected
+    connect.assert_called_once_with(main.DB)
+    assert cursor.execute.call_args.args[1] == ("event-1",)
+    assert "status = 'confirmed'" not in cursor.execute.call_args.args[0]
 
 
 @pytest.mark.parametrize(
@@ -331,3 +364,69 @@ def test_reschedule_rolls_back_claim_when_new_booking_conflicts(
 
     assert response.status_code == 409
     assert connection.__exit__.call_args.args[0] is main.HTTPException
+
+
+@pytest.fixture
+def booking_workflow():
+    path = Path(__file__).resolve().parents[1] / "workflows" / "cmw-booking-bot.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def workflow_targets(workflow, node_name, output=0):
+    return [edge["node"] for edge in workflow["connections"][node_name]["main"][output]]
+
+
+def test_booking_workflow_only_confirms_saved_bookings(booking_workflow):
+    nodes = {node["name"]: node for node in booking_workflow["nodes"]}
+    post = nodes["Create Booking"]
+    response = post["parameters"]["options"]["response"]["response"]
+
+    assert response["fullResponse"] is True
+    assert response["neverError"] is True
+    assert post["onError"] == "continueErrorOutput"
+    assert workflow_targets(booking_workflow, "Create Booking") == ["Booking Saved?"]
+    assert workflow_targets(booking_workflow, "Booking Saved?") == ["Compose Confirmation"]
+    assert workflow_targets(booking_workflow, "Booking Saved?", 1) == ["Booking Conflict?"]
+    assert "statusCode === 201" in nodes["Booking Saved?"]["parameters"]["conditions"]["conditions"][0]["leftValue"]
+    assert "$input.first().json.body" in nodes["Compose Confirmation"]["parameters"]["jsCode"]
+
+
+def test_booking_workflow_deletes_only_an_unreferenced_event_after_409(
+    booking_workflow,
+):
+    nodes = {node["name"]: node for node in booking_workflow["nodes"]}
+    lookup = nodes["Find Event Booking"]
+    delete = nodes["Delete Rejected Event"]
+
+    assert nodes["Booking Conflict?"]["parameters"]["conditions"]["conditions"][0]["leftValue"] == "={{ $json.statusCode === 409 }}"
+    assert workflow_targets(booking_workflow, "Booking Conflict?") == ["Find Event Booking"]
+    assert lookup["parameters"]["url"].endswith("/bookings/by-calendar-event")
+    assert lookup["parameters"]["queryParameters"]["parameters"] == [{
+        "name": "event_id", "value": "={{ $('Create an event').first().json.id }}"
+    }]
+    assert lookup["credentials"] == nodes["Create Booking"]["credentials"]
+    assert workflow_targets(booking_workflow, "Find Event Booking") == ["Event Unreferenced?"]
+    assert nodes["Event Unreferenced?"]["parameters"]["conditions"]["conditions"][0]["leftValue"] == "={{ $json.found === false }}"
+    assert workflow_targets(booking_workflow, "Event Unreferenced?") == ["Delete Rejected Event"]
+    assert delete["parameters"]["operation"] == "delete"
+    assert delete["parameters"]["eventId"] == "={{ $('Create an event').first().json.id }}"
+    assert delete["parameters"]["calendar"] == nodes["Create an event"]["parameters"]["calendar"]
+    assert delete["alwaysOutputData"] is True
+    assert workflow_targets(booking_workflow, "Delete Rejected Event") == ["Conflict Needs Client Reply"]
+
+
+def test_booking_workflow_preserves_event_when_outcome_is_uncertain(
+    booking_workflow,
+):
+    nodes = {node["name"]: node for node in booking_workflow["nodes"]}
+
+    for source in (
+        "Create Booking", "Booking Conflict?", "Find Event Booking",
+        "Event Unreferenced?", "Delete Rejected Event",
+    ):
+        assert workflow_targets(booking_workflow, source, 1) == ["Manual Review Required"]
+    assert nodes["Find Event Booking"]["onError"] == "continueErrorOutput"
+    assert nodes["Delete Rejected Event"]["onError"] == "continueErrorOutput"
+    assert "Verify calendar event" in nodes["Manual Review Required"]["parameters"]["jsCode"]
+    assert "throw new Error" in nodes["Manual Review Required"]["parameters"]["jsCode"]
+    assert "Contact the client" in nodes["Conflict Needs Client Reply"]["parameters"]["jsCode"]

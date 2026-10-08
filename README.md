@@ -14,6 +14,7 @@ The database repo builds the schema (contacts → leads → customers → orders
 | GET | `/contacts` | All contacts, ordered by id |
 | GET | `/customers/{customer_id}/orders` | One customer's orders, newest first. **404** if the customer doesn't exist |
 | GET | `/portal/summary` | Per-customer order count + lifetime spend (three-table JOIN) |
+| GET | `/bookings/by-calendar-event?event_id=...` | API key protected reconciliation lookup. Returns whether any booking, including historical rows, references the event, plus its reference and status. |
 
 Interactive docs with full response schemas at `/docs` once running.
 
@@ -37,6 +38,8 @@ Configuration values:
 The health endpoint and API documentation are public; all database-backed endpoints require an API key. The app does not load `.env` itself; direct Python runs need environment variables set in the shell.
 
 Booking creation and rescheduling use `calendar_event_id` to recognize a repeated request. A matching replay returns the original booking reference; reuse with different details or a conflicting client booking returns HTTP 409. Apply `migrations/001-booking-idempotency.sql` from the sibling `nova-crm-postgresql` repository to existing databases before running this API version. New databases get the constraints from `05-bookings.sql`.
+
+The exported booking workflow checks the event ID after a 409 and deletes the newly created calendar event only when the API confirms that no booking references it. On a timeout, failed lookup, or unexpected response, it keeps the event and fails the execution for manual reconciliation. A successful cleanup also fails the execution so staff can contact the client. This export is an inactive snapshot; update and test the live n8n workflow separately. Configure an n8n error workflow or monitor failed executions so manual reviews are noticed.
 
 For Docker Compose, copy `.env.example` to `.env` in this directory and set both values. Compose reads them for interpolation and passes the resulting values to the containers. Keep `.env` private (`.gitignore` excludes it). The Compose file also needs `nova-crm-postgresql` as a sibling directory for its SQL initialization files.
 
