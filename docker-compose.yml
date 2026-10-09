@@ -26,6 +26,7 @@ services:
     environment:
       DATABASE_URL: "host=db dbname=nova_crm user=postgres password=${POSTGRES_PASSWORD}"
       NOVA_API_KEY: "${NOVA_API_KEY}"
+      BOOKING_RECONCILIATION_ENABLED: "${BOOKING_RECONCILIATION_ENABLED:-false}"
     depends_on:
       db:
         condition: service_healthy

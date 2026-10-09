@@ -101,12 +101,17 @@ on `bookings` (`EXCLUDE USING gist (therapist WITH =, tstzrange(starts_at, ends_
 WITH &&) WHERE status = 'confirmed'`), which rejects overlapping confirmed bookings
 for the same therapist atomically. Where it applies, that race cannot happen.
 
-The gap is `therapist IS NULL`. Two NULLs do not compare equal, so NULL-therapist
-rows never conflict under `no_therapist_overlap`. Booking writes now also use a
-unique calendar event ID, a unique successor per booking, and `no_client_overlap`
-to prevent confirmed bookings for the same client at overlapping times. Different
-clients can still reserve the same time when no therapist is assigned, so the
-availability workflow remains the capacity check for those requests.
+The gap in `no_therapist_overlap` is `therapist IS NULL`: two NULLs do not compare
+equal. Booking writes use a unique calendar event ID, a unique successor per
+booking, and `no_client_overlap` for the same client. API booking writes also
+take a transaction-level table lock and reject a fifth overlapping confirmed
+booking, counting 15 minutes of turnover. This matches the workflow's capacity
+of four. The calendar still contains direct staff entries that the bookings
+table cannot see, so the workflow's calendar availability check remains needed.
+Existing databases need migrations 001, 002, and 003 in order before this API runs. The
+exported booking path claims a confirmation in the database before sending;
+only the first claim returns 201. A claimed send with uncertain delivery needs
+manual review, because the claim does not prove Gmail accepted the message.
 
 ## Ops trivia worth not rediscovering
 

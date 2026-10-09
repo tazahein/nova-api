@@ -1,8 +1,10 @@
 """Checks for API behavior that must not depend on a running database."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -56,6 +58,10 @@ def test_health_check(client, monkeypatch):
                 "calendar_event_id": "event-1",
             }},
         ),
+        ("post", "/bookings/CMW-1234-abcd/confirmation-claim", {}),
+        ("get", "/bookings/CMW-1234-abcd/confirmation-attempt", {}),
+        ("post", "/bookings/CMW-1234-abcd/confirmation-attempts/00000000-0000-0000-0000-000000000001/outcome", {"json": {"state": "uncertain", "reason_code": "timeout"}}),
+        ("post", "/bookings/CMW-1234-abcd/confirmation-attempts/00000000-0000-0000-0000-000000000001/reconcile", {"json": {"state": "failed", "actor": "tester", "note": "Verified no message sent"}}),
         (
             "patch",
             "/bookings/CMW-1234-abcd/cancel",
@@ -247,32 +253,93 @@ def test_create_booking_returns_original_for_matching_event_replay(
     client, booking_db, booking_payload
 ):
     _, cursor = booking_db
-    cursor.fetchone.side_effect = [(12, "CMW-original"), None, (12, "CMW-original")]
+    cursor.fetchone.side_effect = [None, (0,), (12, "CMW-original"),
+                                   (12, "CMW-original")]
 
     first = client.post("/bookings", json=booking_payload,
                         headers={"x-api-key": "test-api-key"})
     repeat = client.post("/bookings", json=booking_payload,
                          headers={"x-api-key": "test-api-key"})
 
-    assert first.status_code == repeat.status_code == 201
+    assert first.status_code == 201
+    assert repeat.status_code == 200
     assert first.json() == repeat.json() == {"id": 12, "booking_ref": "CMW-original"}
-    assert cursor.execute.call_count == 3
-    assert "ON CONFLICT DO NOTHING" in cursor.execute.call_args_list[0].args[0]
-    assert "calendar_event_id = %s" in cursor.execute.call_args_list[2].args[0]
+    assert cursor.execute.call_count == 6
+    assert "LOCK TABLE bookings" in cursor.execute.call_args_list[0].args[0]
+    assert "ON CONFLICT DO NOTHING" in cursor.execute.call_args_list[3].args[0]
+    assert "calendar_event_id = %s" in cursor.execute.call_args_list[5].args[0]
 
 
 def test_create_booking_rejects_event_reuse_or_overlapping_client_booking(
     client, booking_db, booking_payload
 ):
     connection, cursor = booking_db
-    cursor.fetchone.side_effect = [None, None]
+    cursor.fetchone.side_effect = [None, (0,), None]
 
     response = client.post("/bookings", json=booking_payload,
                            headers={"x-api-key": "test-api-key"})
 
     assert response.status_code == 409
-    assert cursor.execute.call_count == 2
+    assert cursor.execute.call_count == 4
     assert connection.__exit__.call_args.args[0] is main.HTTPException
+
+
+def test_create_booking_rejects_full_capacity_before_insert(
+    client, booking_db, booking_payload
+):
+    connection, cursor = booking_db
+    cursor.fetchone.side_effect = [None, (main.BOOKING_CAPACITY,)]
+
+    response = client.post("/bookings", json=booking_payload,
+                           headers={"x-api-key": "test-api-key"})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "No booking capacity at requested time"
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert "SHARE ROW EXCLUSIVE" in statements[0]
+    assert "SUM(delta) OVER" in statements[2]
+    assert all("INSERT INTO bookings" not in sql for sql in statements)
+    assert connection.__exit__.call_args.args[0] is main.HTTPException
+
+
+def test_confirmation_claim_is_one_time(client, booking_db, monkeypatch):
+    _, cursor = booking_db
+    attempt_id = UUID("00000000-0000-0000-0000-000000000001")
+    monkeypatch.setattr(main, "uuid4", lambda: attempt_id)
+    cursor.fetchone.side_effect = [
+        (1, "confirmed", None), None,
+        (1, "confirmed", datetime(2026, 10, 8, tzinfo=timezone.utc)),
+        (attempt_id, "pending", None), None,
+    ]
+
+    first = client.post("/bookings/CMW-original/confirmation-claim",
+                        headers={"x-api-key": "test-api-key"})
+    replay = client.post("/bookings/CMW-original/confirmation-claim",
+                         headers={"x-api-key": "test-api-key"})
+
+    assert first.status_code == 201
+    assert first.json() == {"booking_ref": "CMW-original", "claimed": True,
+                            "attempt_id": str(attempt_id), "state": "pending"}
+    assert replay.status_code == 200
+    assert replay.json() == {"booking_ref": "CMW-original", "claimed": False,
+                             "attempt_id": str(attempt_id), "state": "pending"}
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert "FOR UPDATE" in statements[0]
+    assert sum("INSERT INTO booking_confirmation_attempts" in sql for sql in statements) == 1
+    assert sum("UPDATE bookings SET confirmation_claimed_at" in sql for sql in statements) == 1
+
+
+@pytest.mark.parametrize("status", [None, "cancelled", "superseded"])
+def test_confirmation_claim_rejects_missing_or_inactive_booking(
+    client, booking_db, status
+):
+    _, cursor = booking_db
+    cursor.fetchone.return_value = (1, status, None) if status else None
+
+    response = client.post("/bookings/CMW-original/confirmation-claim",
+                           headers={"x-api-key": "test-api-key"})
+
+    assert response.status_code == 404
 
 
 def test_reschedule_claims_old_booking_before_inserting_successor(
@@ -281,7 +348,7 @@ def test_reschedule_claims_old_booking_before_inserting_successor(
     _, cursor = booking_db
     old = (1, "CMW-old", "client@example.com", "Massage", None, None,
            "event-1", "confirmed")
-    cursor.fetchone.side_effect = [None, old, (1,), ("CMW-new",)]
+    cursor.fetchone.side_effect = [None, old, (1,), (0,), ("CMW-new",)]
 
     response = client.post("/bookings/CMW-old/reschedule", json=reschedule_payload,
                            headers={"x-api-key": "test-api-key"})
@@ -292,8 +359,10 @@ def test_reschedule_claims_old_booking_before_inserting_successor(
         "old_calendar_event_id": "event-1",
     }
     statements = [call.args[0] for call in cursor.execute.call_args_list]
-    assert "WHERE id = %s AND status = 'confirmed' RETURNING id" in statements[2]
-    assert "ON CONFLICT DO NOTHING RETURNING booking_ref" in statements[3]
+    assert "SHARE ROW EXCLUSIVE" in statements[0]
+    assert "WHERE id = %s AND status = 'confirmed' RETURNING id" in statements[3]
+    assert "SUM(delta) OVER" in statements[4]
+    assert "ON CONFLICT DO NOTHING RETURNING booking_ref" in statements[5]
 
 
 def test_reschedule_returns_original_for_matching_event_replay(
@@ -310,7 +379,7 @@ def test_reschedule_returns_original_for_matching_event_replay(
         "booking_ref": "CMW-new", "previous_ref": "CMW-old",
         "old_calendar_event_id": "event-1",
     }
-    assert cursor.execute.call_count == 1
+    assert cursor.execute.call_count == 2
 
 
 def test_reschedule_rejects_event_reuse_with_different_request(
@@ -323,7 +392,7 @@ def test_reschedule_rejects_event_reuse_with_different_request(
                            headers={"x-api-key": "test-api-key"})
 
     assert response.status_code == 409
-    assert cursor.execute.call_count == 1
+    assert cursor.execute.call_count == 2
 
 
 @pytest.mark.parametrize(
@@ -342,7 +411,7 @@ def test_reschedule_handles_lost_claim_after_concurrent_request(
                            headers={"x-api-key": "test-api-key"})
 
     assert response.status_code == expected_status
-    assert cursor.execute.call_count == 4
+    assert cursor.execute.call_count == 5
     assert all("INSERT INTO bookings" not in call.args[0]
                for call in cursor.execute.call_args_list)
     if expected_status == 409:
@@ -357,12 +426,29 @@ def test_reschedule_rolls_back_claim_when_new_booking_conflicts(
     connection, cursor = booking_db
     old = (1, "CMW-old", "client@example.com", "Massage", None, None,
            "event-1", "confirmed")
-    cursor.fetchone.side_effect = [None, old, (1,), None]
+    cursor.fetchone.side_effect = [None, old, (1,), (0,), None]
 
     response = client.post("/bookings/CMW-old/reschedule", json=reschedule_payload,
                            headers={"x-api-key": "test-api-key"})
 
     assert response.status_code == 409
+    assert connection.__exit__.call_args.args[0] is main.HTTPException
+
+
+def test_reschedule_rolls_back_claim_when_capacity_is_full(
+    client, booking_db, reschedule_payload
+):
+    connection, cursor = booking_db
+    old = (1, "CMW-old", "client@example.com", "Massage", None, None,
+           "event-1", "confirmed")
+    cursor.fetchone.side_effect = [None, old, (1,), (main.BOOKING_CAPACITY,)]
+
+    response = client.post("/bookings/CMW-old/reschedule", json=reschedule_payload,
+                           headers={"x-api-key": "test-api-key"})
+
+    assert response.status_code == 409
+    assert all("INSERT INTO bookings" not in call.args[0]
+               for call in cursor.execute.call_args_list)
     assert connection.__exit__.call_args.args[0] is main.HTTPException
 
 
@@ -385,10 +471,68 @@ def test_booking_workflow_only_confirms_saved_bookings(booking_workflow):
     assert response["neverError"] is True
     assert post["onError"] == "continueErrorOutput"
     assert workflow_targets(booking_workflow, "Create Booking") == ["Booking Saved?"]
-    assert workflow_targets(booking_workflow, "Booking Saved?") == ["Compose Confirmation"]
+    assert workflow_targets(booking_workflow, "Booking Saved?") == ["Claim Confirmation"]
     assert workflow_targets(booking_workflow, "Booking Saved?", 1) == ["Booking Conflict?"]
     assert "statusCode === 201" in nodes["Booking Saved?"]["parameters"]["conditions"]["conditions"][0]["leftValue"]
-    assert "$input.first().json.body" in nodes["Compose Confirmation"]["parameters"]["jsCode"]
+    claim = nodes["Claim Confirmation"]
+    assert claim["parameters"]["url"].endswith("/bookings/{{ $json.body.booking_ref }}/confirmation-claim")
+    assert claim["parameters"]["options"]["response"]["response"]["fullResponse"] is True
+    assert claim["onError"] == "continueErrorOutput"
+    assert workflow_targets(booking_workflow, "Claim Confirmation") == ["Confirmation Claim Accepted?"]
+    assert workflow_targets(booking_workflow, "Claim Confirmation", 1) == ["Manual Review Required"]
+    assert workflow_targets(booking_workflow, "Confirmation Claim Accepted?") == ["Compose Confirmation"]
+    assert workflow_targets(booking_workflow, "Confirmation Claim Accepted?", 1) == ["Manual Review Required"]
+    accepted = nodes["Confirmation Claim Accepted?"]["parameters"]["conditions"]["conditions"][0]["leftValue"]
+    assert "statusCode === 201" in accepted
+    assert "state === 'pending'" in accepted
+    assert "attempt_id" in accepted
+    assert "$('Create Booking').first().json.body" in nodes["Compose Confirmation"]["parameters"]["jsCode"]
+    assert "statusCode === 200" in nodes["Manual Review Required"]["parameters"]["jsCode"]
+    assert "before contacting the client" in nodes["Manual Review Required"]["parameters"]["jsCode"]
+
+
+def test_booking_workflow_manual_review_distinguishes_replay_outcomes(
+    booking_workflow,
+):
+    nodes = {node["name"]: node for node in booking_workflow["nodes"]}
+    code = nodes["Manual Review Required"]["parameters"]["jsCode"]
+
+    assert "if (result.statusCode === 200)" not in code
+    assert "result.found === true" in code
+    assert "Preserve the event" in code
+    assert "result.statusCode === 200 && result.body?.claimed === false" in code
+    assert "do not send a second confirmation automatically" in code
+    assert "result.statusCode === 200 && result.body?.booking_ref" in code
+    assert code.index("result.found === true") < code.index("result.body?.claimed === false")
+    assert code.index("result.body?.claimed === false") < code.index("result.body?.booking_ref")
+
+
+def test_booking_workflow_records_gmail_outcome_without_auto_retry(booking_workflow):
+    nodes = {node["name"]: node for node in booking_workflow["nodes"]}
+    assert nodes["Send Confirmation"]["onError"] == "continueErrorOutput"
+    assert nodes["Send Confirmation"]["retryOnFail"] is False
+    assert workflow_targets(booking_workflow, "Send Confirmation") == ["Record Confirmation Sent"]
+    assert workflow_targets(booking_workflow, "Send Confirmation", 1) == ["Record Confirmation Uncertain"]
+    sent = nodes["Record Confirmation Sent"]
+    uncertain = nodes["Record Confirmation Uncertain"]
+    for node in (sent, uncertain):
+        assert node["parameters"]["url"].endswith("/outcome")
+        assert "$('Claim Confirmation').first().json.body.attempt_id" in node["parameters"]["url"]
+        assert node["onError"] == "continueErrorOutput"
+        assert workflow_targets(booking_workflow, node["name"], 1) == ["Manual Review Required"]
+    assert "gmail_message_id: $json.id" in sent["parameters"]["jsonBody"]
+    assert "state: 'uncertain'" in uncertain["parameters"]["jsonBody"]
+    assert workflow_targets(booking_workflow, "Record Confirmation Sent") == []
+    assert workflow_targets(booking_workflow, "Record Confirmation Uncertain") == ["Manual Review Required"]
+    assert "Gmail delivery is uncertain" in nodes["Manual Review Required"]["parameters"]["jsCode"]
+
+
+def test_booking_capacity_matches_calendar_workflow(booking_workflow):
+    nodes = {node["name"]: node for node in booking_workflow["nodes"]}
+    code = nodes["Check Availability"]["parameters"]["jsCode"]
+
+    assert f"const CAPACITY = {main.BOOKING_CAPACITY};" in code
+    assert f"const TURNOVER_MIN = {int(main.BOOKING_TURNOVER.total_seconds() / 60)};" in code
 
 
 def test_booking_workflow_deletes_only_an_unreferenced_event_after_409(

@@ -11,7 +11,7 @@ This runbook is a plan. Running it requires a separate deployment decision. Keep
 - [ ] The owner of booking traffic has chosen a maintenance window and can pause **all** booking writers, including the live n8n workflow and other API clients. Let running executions finish before the migration.
 - [ ] The current published n8n workflow revision, live JSON export, settings, credentials used by each node, and calendar ID are recorded. Confirm how to republish the previous revision.
 - [ ] A verified `nova_crm` database backup exists outside the repositories. Confirm enough space and a tested restore into an isolated database or instance.
-- [ ] The owner accepts the remaining capacity risk: bookings for different clients can overlap while `therapist` is NULL. The n8n availability check is still the capacity control for those requests. All-day events and other calendar blocks still need human handling.
+- [ ] The owner accepts the remaining capacity risk: the API caps confirmed bookings at four overlapping treatments plus 15 minutes of turnover, but direct calendar entries are not in the bookings table. The n8n calendar check remains necessary. All-day events and other ambiguous blocks still need human handling.
 
 Stop if any gate fails. Do not send test bookings to real clients or use real client calendar entries for destructive tests.
 
@@ -32,7 +32,7 @@ Replace the example path and timestamp before running. A successful archive list
 
 ## 2. Check existing data and migrate
 
-For an **existing** Compose `nova_data` volume, SQL files in `/docker-entrypoint-initdb.d` do not run again. Run the one-time migration from the sibling database repository before starting the updated API. A **fresh** database instead gets the constraints from `05-bookings.sql`; do not run the migration on that fresh schema.
+For an **existing** Compose `nova_data` volume, SQL files in `/docker-entrypoint-initdb.d` do not run again. Run migrations 001, 002, and 003 from the sibling database repository in order before starting the updated API. A **fresh** database instead gets the constraints, confirmation claim column, send-attempt ledger, and audit history from `05-bookings.sql`; do not run the migrations on that fresh schema.
 
 Run these checks against the paused production database. The extension query must return `btree_gist`; each conflict query must return zero rows. Record the row count before and after migration.
 
@@ -70,16 +70,48 @@ WHERE conrelid = 'bookings'::regclass
 ORDER BY conname;
 ```
 
-If all three constraints already exist with the expected types (`u`, `u`, `x`), record that the database is migrated and skip the one-time command. If only some exist, stop and investigate before changing the schema.
+If all three constraints already exist with the expected types (`u`, `u`, `x`), skip migration 001. If none exist, run it. If only some exist, stop and investigate before changing the schema.
 
-From the `nova-api` checkout, with `nova-crm-postgresql` as its sibling:
+Check whether `confirmation_claimed_at` is already present. If it is, skip migration 002 after confirming it is a nullable `timestamptz`; stop if it has an unexpected type. Run migration 002 only after migration 001 has been applied or verified.
+
+```sql
+SELECT column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'bookings'
+  AND column_name = 'confirmation_claimed_at';
+```
+
+Check for both `booking_confirmation_attempts` and `booking_confirmation_events` before migration 003. If neither exists, run it only after migration 002. If both exist, verify their constraints, index, append-only trigger, and legacy-claim backfill before skipping it. If only one exists or the objects differ, stop and investigate; do not rerun the migration blindly.
+
+```sql
+SELECT to_regclass('public.booking_confirmation_attempts') AS attempts,
+       to_regclass('public.booking_confirmation_events') AS events;
+```
+
+From the `nova-api` checkout, with `nova-crm-postgresql` as its sibling, run only the migration commands that the checks above show are needed, in this order:
 
 ```bash
 docker compose exec -T db psql -v ON_ERROR_STOP=1 -U postgres -d nova_crm \
   < "../nova-crm-postgresql/migrations/001-booking-idempotency.sql"
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U postgres -d nova_crm \
+  < "../nova-crm-postgresql/migrations/002-booking-confirmation-claim.sql"
+docker compose exec -T db psql -v ON_ERROR_STOP=1 -U postgres -d nova_crm \
+  < "../nova-crm-postgresql/migrations/003-booking-confirmation-attempts.sql"
 ```
 
-The migration takes an exclusive lock on `bookings` and runs in one transaction. A failed precondition or SQL error rolls back its changes. Do not retry until the cause is understood. On success, verify the row count is unchanged, the constraint query returns exactly the three expected rows, and the three conflict queries still return zero rows. Keep booking writers paused if any verification differs.
+Migration 001 takes an exclusive lock on `bookings` and runs in one transaction. Migration 002 adds the nullable confirmation claim column. Migration 003 creates the ledger and append-only audit history and conservatively marks existing claims uncertain. Each migration has its own transaction; an error rolls back that migration. Do not retry until the cause is understood. On success, verify the booking row count is unchanged, the three booking constraints exist, the claim column is nullable `timestamptz`, both ledger tables and the append-only trigger exist, each pre-existing claimed booking has one uncertain attempt and a `legacy_claim` audit event, and the conflict queries still return zero rows. Keep booking writers paused if any verification differs.
+
+```sql
+SELECT b.id
+FROM bookings b
+LEFT JOIN booking_confirmation_attempts a ON a.booking_id = b.id
+LEFT JOIN booking_confirmation_events e
+  ON e.attempt_id = a.id AND e.action = 'legacy_claim'
+WHERE b.confirmation_claimed_at IS NOT NULL
+  AND (a.id IS NULL OR a.state <> 'uncertain' OR e.id IS NULL);
+```
+
+The query must return zero rows before the updated API starts.
 
 ## 3. Release and verify the API
 
@@ -90,7 +122,7 @@ Verify against the deployed API:
 1. `GET /` returns the expected health message, and the API container remains running with no new database errors.
 2. `GET /bookings/by-calendar-event?event_id=...` returns 401 without a valid `X-API-Key`.
 3. With the key, an unknown event ID returns `found: false` and null reference/status. A known historical event ID returns `found: true` with its booking reference and status. Use read-only checks on production data.
-4. In the nonproduction environment, a repeated identical `POST /bookings` returns the original reference, a conflicting request returns 409, and concurrent attempts produce one booking. Confirm the database and calendar have no unintended duplicates.
+4. In the nonproduction environment, a new `POST /bookings` returns 201, an identical replay returns the original reference with 200, and a conflicting request returns 409. The first confirmation claim returns 201 and a repeated or concurrent claim returns 200. Four different clients may book the same treatment window; a fifth concurrent request must receive 409. Staggered bookings with a peak below four must remain allowed. Verify that the 15-minute turnover is included and the database and calendar have no unintended duplicates.
 
 Do not resume booking traffic yet.
 
@@ -100,13 +132,14 @@ The committed `workflows/cmw-booking-bot.json` is **inactive** and contains a ma
 
 In the live editor, check these paths and settings:
 
-- `Create Booking` must return the full HTTP response and route HTTP errors for inspection. A 201 goes to the normal confirmation path.
+- `Create Booking` must return the full HTTP response and route HTTP errors for inspection. A new 201 calls `Claim Confirmation` with the booking reference. Only a 201 claim reaches `Compose Confirmation` and `Send Confirmation`. A replayed booking 200, repeated claim 200, or uncertain claim response fails for manual review of prior confirmation delivery; it must not send another confirmation. The claim records an attempted send, not proven delivery.
+- `Send Confirmation` must have automatic retry disabled. Restarting execution directly at that Gmail node bypasses the one-time claim. Reconcile the ledger, Gmail Sent folder, and recipient outcome before any manual resend; leave an unresolved attempt uncertain. Mark it failed only with documented proof that Gmail was never invoked or definitively rejected the send. An empty Sent folder or inbox alone does not establish non-delivery. Record the proof category and details in the manual reconciliation audit.
 - A 409 goes to `Find Event Booking`, which calls the API-key-protected event-ID lookup using the **newly created** calendar event ID. Only a valid `found: false` response may reach `Delete Rejected Event`.
 - `found: true` keeps the calendar event and raises `Manual Review Required`. A timeout, 5xx, missing/invalid lookup response, or failed lookup also keeps the event and raises manual review.
 - After confirmed deletion, `Conflict Needs Client Reply` raises a failed execution for staff follow-up. If deletion fails or its result is uncertain, treat the event as present until manually checked.
 - Connect the failed executions to an n8n error workflow or ensure staff actively monitor them. Verify an owner receives and acts on the alert.
 
-Exercise the **whole** workflow in a nonproduction copy with controlled records and calendar events. Cover 201 success, 409 with no linked booking, 409 with a linked historical booking, API timeout/5xx, lookup failure, and calendar deletion failure. Verify exactly one confirmation on success, no confirmation on a conflict, deletion only after a confirmed `found: false`, and an actionable failed execution for every manual path. Running a single node can reuse stale upstream data.
+Exercise the **whole** workflow in a nonproduction copy with controlled records and calendar events. Cover 201 success with a 201 claim, repeated booking request returning 200, replay of a saved booking 201 followed by a 200 claim, 409 with no linked booking, 409 with a linked historical booking, API timeout/5xx, claim timeout, lookup failure, and calendar deletion failure. Verify exactly one confirmation on first success, no second confirmation on either replay, no confirmation on a conflict, deletion only after a confirmed `found: false`, and an actionable failed execution for every manual path. Running a single node can reuse stale upstream data.
 
 Save and **publish** the updated live workflow; changing the editor or Active toggle alone does not prove the published workflow changed. Run a controlled end-to-end check against the published revision, then export that live revision and compare the booking branches and settings with the reviewed design. Record the new published revision.
 

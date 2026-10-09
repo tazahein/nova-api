@@ -1,8 +1,10 @@
 import os
 import secrets
-from datetime import datetime
+from uuid import UUID, uuid4
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Depends, Header
-from pydantic import BaseModel, model_validator
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, model_validator
 from typing import Literal
 import psycopg
 
@@ -11,6 +13,9 @@ app = FastAPI()
 DB = os.environ.get("DATABASE_URL", "dbname=nova_crm")
 
 API_KEY = os.environ.get("NOVA_API_KEY")
+BOOKING_CAPACITY = 4
+BOOKING_TURNOVER = timedelta(minutes=15)
+BOOKING_RECONCILIATION_ENABLED = os.environ.get("BOOKING_RECONCILIATION_ENABLED") == "true"
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)):
@@ -62,6 +67,45 @@ class RescheduleIn(BaseModel):
     calendar_event_id: str
 
 
+class ConfirmationOutcomeIn(BaseModel):
+    state: Literal["confirmed", "uncertain"]
+    gmail_message_id: str | None = Field(default=None, min_length=1, max_length=255)
+    reason_code: str | None = Field(default=None, min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def require_outcome_evidence(self):
+        if self.state == "confirmed" and not self.gmail_message_id:
+            raise ValueError("confirmed outcome requires a Gmail message ID")
+        if self.state == "uncertain" and not self.reason_code:
+            raise ValueError("uncertain outcome requires a reason code")
+        if self.state == "uncertain" and self.gmail_message_id:
+            raise ValueError("uncertain outcome cannot include a Gmail message ID")
+        return self
+
+
+class ConfirmationReconciliationIn(BaseModel):
+    state: Literal["confirmed", "failed"]
+    actor: str = Field(min_length=2, max_length=100)
+    note: str = Field(min_length=10, max_length=500)
+    gmail_message_id: str | None = Field(default=None, min_length=1, max_length=255)
+    non_delivery_verified: bool = False
+    non_delivery_proof: Literal["before_gmail_invocation", "definitive_provider_rejection"] | None = None
+    non_delivery_evidence: str | None = Field(default=None, min_length=20, max_length=500)
+
+    @model_validator(mode="after")
+    def require_confirmed_message(self):
+        if self.state == "confirmed" and not self.gmail_message_id:
+            raise ValueError("confirmed reconciliation requires a Gmail message ID")
+        if self.state == "failed" and (
+            not self.non_delivery_verified or not self.non_delivery_proof
+            or not self.non_delivery_evidence
+        ):
+            raise ValueError("failed reconciliation requires verified non-delivery evidence")
+        if self.state == "failed" and self.gmail_message_id:
+            raise ValueError("failed reconciliation cannot include a Gmail message ID")
+        return self
+
+
 def _new_ref() -> str:
     # Random token, not a sequence: a guessable ref would let anyone
     # cancel a stranger's booking by incrementing a number.
@@ -101,6 +145,43 @@ FROM bookings b
 LEFT JOIN bookings previous ON previous.id = b.supersedes_id
 WHERE b.calendar_event_id = %s;
 """
+
+
+_PEAK_BOOKINGS = """
+WITH candidate AS (
+    SELECT %s::timestamptz AS starts_at, %s::timestamptz AS ends_at,
+           %s::interval AS turnover
+), edges AS (
+    SELECT edge.instant, edge.delta
+    FROM candidate c
+    JOIN bookings b ON b.status = 'confirmed'
+      AND b.starts_at < c.ends_at + c.turnover
+      AND b.ends_at + c.turnover > c.starts_at
+    CROSS JOIN LATERAL (VALUES
+        (GREATEST(b.starts_at, c.starts_at), 1),
+        (LEAST(b.ends_at + c.turnover, c.ends_at + c.turnover), -1)
+    ) AS edge(instant, delta)
+), changes AS (
+    SELECT instant, SUM(delta) AS delta FROM edges GROUP BY instant
+), occupancy AS (
+    SELECT SUM(delta) OVER (ORDER BY instant) AS booked FROM changes
+)
+SELECT COALESCE(MAX(booked), 0) FROM occupancy;
+"""
+
+
+def _lock_booking_writes(cur):
+    # Serialize the capacity check with all booking table writers, including
+    # other API workers. Ordinary reads can continue during the short lock.
+    cur.execute("LOCK TABLE bookings IN SHARE ROW EXCLUSIVE MODE;")
+
+
+def _check_booking_capacity(cur, starts_at: datetime, ends_at: datetime):
+    # Counting every overlapping row would reject valid staggered bookings.
+    # The peak count uses the same turnover window as the calendar check.
+    cur.execute(_PEAK_BOOKINGS, (starts_at, ends_at, BOOKING_TURNOVER))
+    if cur.fetchone()[0] >= BOOKING_CAPACITY:
+        raise HTTPException(status_code=409, detail="No booking capacity at requested time")
 
 
 def _replayed_reschedule(cur, ref: str, body: RescheduleIn):
@@ -229,10 +310,27 @@ def create_inquiry(inq: InquiryIn):
 @app.post("/bookings", status_code=201, dependencies=[Depends(require_api_key)])
 def create_booking(b: BookingIn):
     # Calendar event is created by the workflow first, so its ID exists
-    # here. A replay of the same event returns the original booking.
+    # here. A replay returns 200 so the workflow does not send twice.
     ref = _new_ref()
     with psycopg.connect(DB) as conn:
         with conn.cursor() as cur:
+            _lock_booking_writes(cur)
+            cur.execute(
+                "SELECT id, booking_ref FROM bookings "
+                "WHERE calendar_event_id = %s AND client_email = %s "
+                "AND client_name IS NOT DISTINCT FROM %s "
+                "AND treatment = %s AND starts_at = %s AND ends_at = %s "
+                "AND thread_id IS NOT DISTINCT FROM %s "
+                "AND supersedes_id IS NULL AND status = 'confirmed';",
+                (b.calendar_event_id, b.client_email, b.client_name,
+                 b.treatment, b.starts_at, b.ends_at, b.thread_id),
+            )
+            replay = cur.fetchone()
+            if replay is not None:
+                return JSONResponse(status_code=200, content={
+                    "id": replay[0], "booking_ref": replay[1]
+                })
+            _check_booking_capacity(cur, b.starts_at, b.ends_at)
             cur.execute(
                 "INSERT INTO bookings "
                 "(booking_ref, client_email, client_name, treatment, "
@@ -244,22 +342,190 @@ def create_booking(b: BookingIn):
             )
             row = cur.fetchone()
             if row is None:
-                cur.execute(
-                    "SELECT id, booking_ref FROM bookings "
-                    "WHERE calendar_event_id = %s AND client_email = %s "
-                    "AND client_name IS NOT DISTINCT FROM %s "
-                    "AND treatment = %s AND starts_at = %s AND ends_at = %s "
-                    "AND thread_id IS NOT DISTINCT FROM %s "
-                    "AND supersedes_id IS NULL AND status = 'confirmed';",
-                    (b.calendar_event_id, b.client_email, b.client_name,
-                     b.treatment, b.starts_at, b.ends_at, b.thread_id),
+                raise HTTPException(
+                    status_code=409, detail="Booking conflicts with an existing booking"
                 )
-                row = cur.fetchone()
-                if row is None:
-                    raise HTTPException(
-                        status_code=409, detail="Booking conflicts with an existing booking"
-                    )
     return {"id": row[0], "booking_ref": row[1]}
+
+
+@app.post("/bookings/{ref}/confirmation-claim", status_code=201,
+          dependencies=[Depends(require_api_key)])
+def claim_booking_confirmation(ref: str):
+    # The booking row lock and unique attempt key serialize concurrent runs.
+    # No automatic path can claim a second attempt, even after a failure.
+    with psycopg.connect(DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, status, confirmation_claimed_at FROM bookings "
+                "WHERE booking_ref = %s FOR UPDATE;",
+                (ref,),
+            )
+            booking = cur.fetchone()
+            if booking is None or booking[1] != "confirmed":
+                raise HTTPException(status_code=404, detail="Booking not found")
+            cur.execute(
+                "SELECT id, state, gmail_message_id FROM booking_confirmation_attempts "
+                "WHERE booking_id = %s FOR UPDATE;",
+                (booking[0],),
+            )
+            attempt = cur.fetchone()
+            if attempt is not None:
+                state = _expire_pending_attempt(cur, attempt[0], attempt[1])
+                return JSONResponse(status_code=200, content={
+                    "booking_ref": ref, "claimed": False,
+                    "attempt_id": str(attempt[0]), "state": state,
+                })
+
+            attempt_id = uuid4()
+            if booking[2] is not None:
+                # Fail closed if an older claim lacks an attempt row.
+                state, action, actor = "uncertain", "legacy_claim", "migration"
+                claimed_at = booking[2]
+            else:
+                state, action, actor = "pending", "claim", "workflow"
+                claimed_at = None
+                cur.execute(
+                    "UPDATE bookings SET confirmation_claimed_at = now() "
+                    "WHERE id = %s;",
+                    (booking[0],),
+                )
+            cur.execute(
+                "INSERT INTO booking_confirmation_attempts "
+                "(id, booking_id, state, claimed_at) "
+                "VALUES (%s, %s, %s, COALESCE(%s, now()));",
+                (attempt_id, booking[0], state, claimed_at),
+            )
+            _record_confirmation_event(cur, attempt_id, None, state,
+                                       action, actor, None, None)
+    response = {
+        "booking_ref": ref, "claimed": state == "pending",
+        "attempt_id": str(attempt_id), "state": state,
+    }
+    return response if state == "pending" else JSONResponse(status_code=200, content=response)
+
+
+def _record_confirmation_event(cur, attempt_id, old_state, new_state,
+                               action, actor, note, gmail_message_id):
+    cur.execute(
+        "INSERT INTO booking_confirmation_events "
+        "(attempt_id, from_state, to_state, action, actor, note, gmail_message_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s);",
+        (attempt_id, old_state, new_state, action, actor, note, gmail_message_id),
+    )
+
+
+def _expire_pending_attempt(cur, attempt_id, state):
+    if state != "pending":
+        return state
+    cur.execute(
+        "UPDATE booking_confirmation_attempts "
+        "SET state = 'uncertain', changed_at = now() "
+        "WHERE id = %s AND state = 'pending' "
+        "AND claimed_at < now() - interval '2 minutes' RETURNING id;",
+        (attempt_id,),
+    )
+    if cur.fetchone() is None:
+        return state
+    _record_confirmation_event(cur, attempt_id, "pending", "uncertain",
+                               "timeout", "system", "No outcome within two minutes", None)
+    return "uncertain"
+
+
+@app.get("/bookings/{ref}/confirmation-attempt",
+         dependencies=[Depends(require_api_key)])
+def get_booking_confirmation_attempt(ref: str):
+    with psycopg.connect(DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT a.id, a.state, a.gmail_message_id "
+                "FROM booking_confirmation_attempts a "
+                "JOIN bookings b ON b.id = a.booking_id "
+                "WHERE b.booking_ref = %s FOR UPDATE OF a;",
+                (ref,),
+            )
+            attempt = cur.fetchone()
+            if attempt is None:
+                raise HTTPException(status_code=404, detail="Confirmation attempt not found")
+            state = _expire_pending_attempt(cur, attempt[0], attempt[1])
+            cur.execute(
+                "SELECT from_state, to_state, action, actor, note, "
+                "gmail_message_id, recorded_at FROM booking_confirmation_events "
+                "WHERE attempt_id = %s ORDER BY id;",
+                (attempt[0],),
+            )
+            history = [
+                {"from_state": row[0], "to_state": row[1], "action": row[2],
+                 "actor": row[3], "note": row[4], "gmail_message_id": row[5],
+                 "recorded_at": row[6].isoformat()}
+                for row in cur.fetchall()
+            ]
+    return {"booking_ref": ref, "attempt_id": str(attempt[0]),
+            "state": state, "gmail_message_id": attempt[2], "history": history}
+
+
+def _transition_confirmation_attempt(ref, attempt_id, new_state, action,
+                                     actor, note, gmail_message_id, manual):
+    with psycopg.connect(DB) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT a.state, a.gmail_message_id "
+                "FROM booking_confirmation_attempts a "
+                "JOIN bookings b ON b.id = a.booking_id "
+                "WHERE b.booking_ref = %s AND a.id = %s FOR UPDATE OF a;",
+                (ref, attempt_id),
+            )
+            previous = cur.fetchone()
+            if previous is None:
+                raise HTTPException(status_code=404, detail="Confirmation attempt not found")
+            old_state, old_message_id = previous
+            if old_state == new_state and old_message_id == gmail_message_id:
+                return JSONResponse(status_code=200, content={
+                    "booking_ref": ref, "attempt_id": str(attempt_id), "state": new_state,
+                })
+            if manual:
+                allowed = (new_state == "failed" and old_state == "uncertain"
+                           and old_message_id is None) or (
+                    new_state == "confirmed" and old_state in ("pending", "uncertain", "failed")
+                )
+            else:
+                allowed = old_state in ("pending", "uncertain")
+            if not allowed:
+                raise HTTPException(status_code=409, detail="Attempt is already resolved")
+            cur.execute(
+                "UPDATE booking_confirmation_attempts "
+                "SET state = %s, gmail_message_id = COALESCE(%s, gmail_message_id), "
+                "changed_at = now() WHERE id = %s;",
+                (new_state, gmail_message_id, attempt_id),
+            )
+            _record_confirmation_event(cur, attempt_id, old_state, new_state,
+                                       action, actor, note, gmail_message_id)
+    return {"booking_ref": ref, "attempt_id": str(attempt_id), "state": new_state}
+
+
+@app.post("/bookings/{ref}/confirmation-attempts/{attempt_id}/outcome",
+          dependencies=[Depends(require_api_key)])
+def record_booking_confirmation_outcome(ref: str, attempt_id: UUID,
+                                        outcome: ConfirmationOutcomeIn):
+    return _transition_confirmation_attempt(
+        ref, attempt_id, outcome.state, "workflow_" + outcome.state,
+        "workflow", outcome.reason_code, outcome.gmail_message_id, False,
+    )
+
+
+@app.post("/bookings/{ref}/confirmation-attempts/{attempt_id}/reconcile",
+          dependencies=[Depends(require_api_key)])
+def reconcile_booking_confirmation(ref: str, attempt_id: UUID,
+                                   decision: ConfirmationReconciliationIn):
+    if not BOOKING_RECONCILIATION_ENABLED:
+        raise HTTPException(status_code=403, detail="Manual reconciliation is disabled")
+    note = decision.note
+    if decision.state == "failed":
+        note += (" | Verified non-delivery (" + decision.non_delivery_proof
+                 + "): " + decision.non_delivery_evidence)
+    return _transition_confirmation_attempt(
+        ref, attempt_id, decision.state, "reconciled_" + decision.state,
+        decision.actor, note, decision.gmail_message_id, True,
+    )
 
 
 @app.get("/bookings/lookup", dependencies=[Depends(require_api_key)])
@@ -350,6 +616,7 @@ def reschedule_booking(ref: str, body: RescheduleIn):
     new_ref = _new_ref()
     with psycopg.connect(DB) as conn:
         with conn.cursor() as cur:
+            _lock_booking_writes(cur)
             replay = _replayed_reschedule(cur, ref, body)
             if replay is not None:
                 return replay
@@ -370,6 +637,7 @@ def reschedule_booking(ref: str, body: RescheduleIn):
                 raise HTTPException(
                     status_code=409, detail="Booking was changed by another request"
                 )
+            _check_booking_capacity(cur, body.starts_at, body.ends_at)
             cur.execute(
                 "INSERT INTO bookings "
                 "(booking_ref, client_email, client_name, treatment, "

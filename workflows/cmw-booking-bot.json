@@ -263,12 +263,12 @@
     },
     {
       "parameters": {
-        "jsCode": "const booking = $input.first().json.body;     // {id, booking_ref}\nconst slot = $('Route Decision').first().json;\nconst req = $('Classify Intent').first().json;\n\nconst ref = booking.booking_ref;\nconst name = req.client_name || 'there';\n\n// The ref must survive being quoted in a reply: the cancel/reschedule path\n// regex-extracts it from the FULL body, quoted text included. Keep it on its\n// own line, unstyled, no markup that could split the token.\nconst body = [\n  `Hi ${name},`,\n  ``,\n  `Your booking is confirmed.`,\n  ``,\n  `  ${slot.start_human}`,\n  `  ${slot.treatment} (${slot.duration_min} minutes)`,\n  ``,\n  `Booking reference: ${ref}`,\n  ``,\n  `To change or cancel, just reply to this email and quote your booking`,\n  `reference above. Please give us at least 24 hours' notice.`,\n  ``,\n  `Payment is on arrival.`,\n  ``,\n  `See you soon,`,\n  `Chiang Mai Wellness Retreat`,\n].join('\\n');\n\nreturn [{\n  json: {\n    booking_ref: ref,\n    to: req.client_email || 'nan@example.com',\n    subject: `Booking confirmed — ${slot.start_human} (${ref})`,\n    body: body,\n  },\n}];"
+        "jsCode": "const booking = $('Create Booking').first().json.body;     // {id, booking_ref}\nconst slot = $('Route Decision').first().json;\nconst req = $('Classify Intent').first().json;\n\nconst ref = booking.booking_ref;\nconst name = req.client_name || 'there';\n\n// The ref must survive being quoted in a reply: the cancel/reschedule path\n// regex-extracts it from the FULL body, quoted text included. Keep it on its\n// own line, unstyled, no markup that could split the token.\nconst body = [\n  `Hi ${name},`,\n  ``,\n  `Your booking is confirmed.`,\n  ``,\n  `  ${slot.start_human}`,\n  `  ${slot.treatment} (${slot.duration_min} minutes)`,\n  ``,\n  `Booking reference: ${ref}`,\n  ``,\n  `To change or cancel, just reply to this email and quote your booking`,\n  `reference above. Please give us at least 24 hours' notice.`,\n  ``,\n  `Payment is on arrival.`,\n  ``,\n  `See you soon,`,\n  `Chiang Mai Wellness Retreat`,\n].join('\\n');\n\nreturn [{\n  json: {\n    booking_ref: ref,\n    to: req.client_email || 'nan@example.com',\n    subject: `Booking confirmed — ${slot.start_human} (${ref})`,\n    body: body,\n  },\n}];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1696,
+        2112,
         -352
       ],
       "id": "ed9849b6-1113-4b69-9fcf-caafdf049207",
@@ -285,18 +285,20 @@
       "type": "n8n-nodes-base.gmail",
       "typeVersion": 2.2,
       "position": [
-        1904,
+        2320,
         -352
       ],
       "id": "7eb6250b-db32-46e0-af9d-7e9eb850ef79",
       "name": "Send Confirmation",
       "webhookId": "d5107642-d0fe-422c-b600-1c79b0bdfe26",
+      "retryOnFail": false,
       "credentials": {
         "gmailOAuth2": {
           "id": "4byPKNOedREFDdwS",
           "name": "Gmail account"
         }
-      }
+      },
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -543,7 +545,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const eventId = $('Create an event').first().json.id;\nthrow new Error('Booking outcome needs manual reconciliation. Verify calendar event ' + eventId + ' and its booking record before retrying or cleaning up.');"
+        "jsCode": "const eventId = $('Create an event').first().json.id;\nconst result = $input.first().json;\nif (result.found === true) {\n  throw new Error('Calendar event ' + eventId + ' is linked to a booking. Preserve the event and verify the booking and confirmation history before contacting the client.');\n}\nif (result.state === 'uncertain' || result.body?.state === 'uncertain') {\n  throw new Error('Gmail delivery is uncertain for calendar event ' + eventId + '. Check the send-attempt history and Sent folder before any manual action; do not resend automatically.');\n}\nif (result.statusCode === 200 && result.body?.claimed === false) {\n  throw new Error('Confirmation claim already recorded for calendar event ' + eventId + '. Check send history before retrying; do not send a second confirmation automatically.');\n}\nif (result.statusCode === 200 && result.body?.booking_ref) {\n  throw new Error('Booking API replay for calendar event ' + eventId + '. Check whether confirmation was already sent before contacting the client.');\n}\nthrow new Error('Booking or confirmation outcome needs manual reconciliation. Verify calendar event ' + eventId + ' plus its booking and confirmation history before retrying or cleaning up.');"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -566,6 +568,131 @@
       ],
       "id": "cf5a2b5e-c9e0-4005-8e3b-c7abc876a14a",
       "name": "Conflict Needs Client Reply"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://your-api-host.example.com/bookings/{{ $json.body.booking_ref }}/confirmation-claim",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1696,
+        -352
+      ],
+      "id": "5bdccdc5-f32c-4955-84b2-1bdbe9090035",
+      "name": "Claim Confirmation",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "bUPVkc7A2voA4Sny",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "8666e312-5661-44f7-93fa-a9c982e6d7e3",
+              "leftValue": "={{ $json.statusCode === 201 && !!$json.body && $json.body.claimed === true && $json.body.state === 'pending' && !!$json.body.attempt_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1904,
+        -352
+      ],
+      "id": "37a36c93-36ce-4277-8d0f-9351b3449a10",
+      "name": "Confirmation Claim Accepted?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://your-api-host.example.com/bookings/{{ $('Create Booking').first().json.body.booking_ref }}/confirmation-attempts/{{ $('Claim Confirmation').first().json.body.attempt_id }}/outcome",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ state: 'confirmed', gmail_message_id: $json.id }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2528,
+        -432
+      ],
+      "id": "5fd77135-d0db-4b9d-aa91-43c0346d0d24",
+      "name": "Record Confirmation Sent",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "bUPVkc7A2voA4Sny",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://your-api-host.example.com/bookings/{{ $('Create Booking').first().json.body.booking_ref }}/confirmation-attempts/{{ $('Claim Confirmation').first().json.body.attempt_id }}/outcome",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ state: 'uncertain', reason_code: 'gmail_error_or_timeout' }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2528,
+        -272
+      ],
+      "id": "3bd478ab-f965-45cd-b09e-6a235751a5dd",
+      "name": "Record Confirmation Uncertain",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "bUPVkc7A2voA4Sny",
+          "name": "Header Auth account"
+        }
+      },
+      "onError": "continueErrorOutput"
     }
   ],
   "pinData": {},
@@ -703,7 +830,7 @@
       "main": [
         [
           {
-            "node": "Compose Confirmation",
+            "node": "Claim Confirmation",
             "type": "main",
             "index": 0
           }
@@ -776,6 +903,90 @@
         [
           {
             "node": "Conflict Needs Client Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Manual Review Required",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Confirmation Claim Accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Manual Review Required",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirmation Claim Accepted?": {
+      "main": [
+        [
+          {
+            "node": "Compose Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Manual Review Required",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Record Confirmation Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Confirmation Uncertain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Confirmation Sent": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Manual Review Required",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Confirmation Uncertain": {
+      "main": [
+        [
+          {
+            "node": "Manual Review Required",
             "type": "main",
             "index": 0
           }
